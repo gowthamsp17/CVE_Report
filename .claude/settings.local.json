@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 cve_report.py CVE-2026-53359 --stdout --no-diff)",
+      "Bash(sed -n '/## 3/,/## 4/p')",
+      "Bash(python3 cve_report.py CVE-2026-53359 --stdout)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -)"
+    ]
+  }
+}
