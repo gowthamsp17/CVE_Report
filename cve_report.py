@@ -12,6 +12,13 @@ Data sources (all official / trusted):
   * FIRST EPSS API            (exploit-prediction score)
   * CISA KEV catalog          (known-exploited status)
   * git.kernel.org            (commit patches: dates, authors, diffs, functions)
+  * Red Hat Security Data API (RHSA advisories, per-product fix state, mitigation)
+  * Debian Security Tracker   (per-suite status/fixed_version, cached full dump)
+  * Arch Linux Security       (package status + fixed version, when tracked)
+  * OSV.dev                   (aggregator: commit ranges, related distro advisories)
+  * linuxkernelcves.com data  (colloquial vuln name, affected/last-vulnerable version)
+  * Exploit-DB                (public PoC-exploit availability)
+  * Ubuntu / SUSE             (reference links only -- no public per-CVE API)
 
 Optimized for Linux-kernel (kernel.org CNA) CVEs. The per-branch fix->release
 mapping comes from the kernel security team's own dyad file, which authoritatively
@@ -24,6 +31,7 @@ Usage:
     python3 cve_report.py CVE-2026-53359 --json-only       # data pack to stdout
     python3 cve_report.py CVE-2026-53359 -o /path/out.md
     python3 cve_report.py CVE-2026-53359 --no-diff         # skip commit patches
+    python3 cve_report.py CVE-2026-53359 --no-vendor       # skip vendor/distro lookups
 
 No third-party dependencies (stdlib only). Set NVD_API_KEY to raise NVD limits.
 """
@@ -31,6 +39,7 @@ No third-party dependencies (stdlib only). Set NVD_API_KEY to raise NVD limits.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -49,6 +58,23 @@ KERNEL_GIT = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
 VULNS_GIT = "https://git.kernel.org/pub/scm/linux/security/vulns.git"
 CACHE_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "cve_report_cache")
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+
+# vendor / distro / aggregator sources (verified empirically: no auth, no API
+# key, stdlib-fetchable -- see fetch_redhat/fetch_archlinux/fetch_osv/etc.)
+REDHAT_CVE_API = "https://access.redhat.com/hydra/rest/securitydata/cve/%s.json"
+REDHAT_CVE_PAGE = "https://access.redhat.com/security/cve/%s"
+DEBIAN_TRACKER_JSON = "https://security-tracker.debian.org/tracker/data/json"
+DEBIAN_CVE_PAGE = "https://security-tracker.debian.org/tracker/%s"
+ARCH_ITEM_API = "https://security.archlinux.org/%s.json"
+ARCH_CVE_PAGE = "https://security.archlinux.org/%s"
+OSV_API = "https://api.osv.dev/v1/vulns/%s"
+OSV_PAGE = "https://osv.dev/vulnerability/%s"
+LKC_JSON = ("https://raw.githubusercontent.com/nluedtke/linux_kernel_cves/"
+            "master/data/kernel_cves.json")
+EXPLOITDB_SEARCH = "https://www.exploit-db.com/search?cve=%s"
+EXPLOITDB_EXPLOIT_PAGE = "https://www.exploit-db.com/exploits/%s"
+UBUNTU_CVE_PAGE = "https://ubuntu.com/security/%s"
+SUSE_CVE_PAGE = "https://www.suse.com/security/cve/%s.html"
 
 # tokens that appear in diff hunk context but are NOT the changed function
 NOT_A_FUNCTION = re.compile(
@@ -102,7 +128,10 @@ def _http(url, timeout=30, headers=None, retries=3):
         try:
             req = urllib.request.Request(url, headers=hdrs)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                data = resp.read()
+                if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                    data = gzip.decompress(data)
+                return data
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 404:
@@ -247,6 +276,85 @@ def fetch_kev(cve_id):
         if v.get("cveID", "").upper() == cve_id.upper():
             return v
     return None
+
+
+def fetch_redhat(cve_id):
+    """Red Hat Security Data API: per-CVE JSON (RHSA advisories, CVSS3, CWE,
+    per-product fix state, mitigation). 404 for CVEs irrelevant to Red Hat
+    products -- that's a normal, expected outcome, not an error."""
+    return _http_json(REDHAT_CVE_API % cve_id, timeout=15)
+
+
+def fetch_archlinux(cve_id):
+    """Arch Linux Security Tracker: per-CVE JSON, chained to its AVG group
+    (which carries the actual affected/fixed package version + status).
+    Coverage is partial -- Arch only tracks CVEs affecting shipped packages,
+    so 404 (no data) is common and expected."""
+    rec = _http_json(ARCH_ITEM_API % cve_id, timeout=15)
+    if not rec:
+        return None
+    for group in rec.get("groups") or []:
+        info = _http_json(ARCH_ITEM_API % group, timeout=15)
+        if info:
+            rec["group_info"] = info
+            break
+    return rec
+
+
+def fetch_osv(cve_id):
+    """OSV.dev: mirrors the full cvelistV5 dataset keyed by plain CVE ID.
+    Useful mainly for git-commit-level introduced/fixed ranges and the list
+    of related distro advisory IDs (USN-/SUSE-SU-/ALSA- etc.)."""
+    return _http_json(OSV_API % cve_id, timeout=15)
+
+
+def fetch_linuxkernelcves(cve_id):
+    """linuxkernelcves.com data (community-maintained, no accuracy guarantee):
+    single ~6MB JSON dump keyed by CVE ID, cached locally with a TTL. Adds
+    colloquial vuln names (e.g. "Dirty Pipe") and affected/last-vulnerable
+    kernel version ranges."""
+    raw = _cached("linux_kernel_cves.json", 24 * 3600,
+                  lambda: _http(LKC_JSON, timeout=45))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    return data.get(cve_id)
+
+
+def fetch_debian_entry(cve_id):
+    """Debian Security Tracker has no per-CVE endpoint -- only a single large
+    JSON dump (~80MB uncompressed, requesting gzip cuts the transfer to
+    ~12MB), cached locally with a TTL and looked up by source package."""
+    raw = _cached("debian_tracker.json", 24 * 3600, lambda: _http(
+        DEBIAN_TRACKER_JSON, timeout=60, headers={"Accept-Encoding": "gzip"}))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    pkg_data = data.get("linux") or {}
+    if cve_id in pkg_data:
+        return {"package": "linux", "data": pkg_data[cve_id]}
+    for pkg, cves in data.items():  # fallback for non-kernel CVEs
+        if cve_id in cves:
+            return {"package": pkg, "data": cves[cve_id]}
+    return None
+
+
+def fetch_exploitdb(cve_id):
+    """Exploit-DB's internal search AJAX endpoint (undocumented, but reliably
+    returns JSON with the X-Requested-With header). Returns None on fetch
+    failure vs. [] on a confirmed zero-hit lookup -- callers should treat
+    those differently."""
+    data = _http_json(EXPLOITDB_SEARCH % cve_id, timeout=15,
+                       headers={"X-Requested-With": "XMLHttpRequest"})
+    if data is None:
+        return None
+    return data.get("data") or []
 
 
 def _unfold_headers(text):
@@ -627,6 +735,80 @@ def parse_ssvc(cvelist):
     return None
 
 
+def summarize_redhat(rh):
+    if not isinstance(rh, dict):
+        return None
+    advisories, seen = [], set()
+    for rel in rh.get("affected_release", []) or []:
+        adv = rel.get("advisory")
+        if adv and adv not in seen:
+            seen.add(adv)
+            advisories.append({"id": adv, "product": rel.get("product_name")})
+    return {
+        "severity": rh.get("threat_severity"),
+        "cvss3_score": _dig(rh, "cvss3", "cvss3_base_score"),
+        "cvss3_vector": _dig(rh, "cvss3", "cvss3_scoring_vector"),
+        "cwe": rh.get("cwe"),
+        "advisories": advisories,
+        "mitigation": _dig(rh, "mitigation", "value"),
+        "link": REDHAT_CVE_PAGE % rh.get("name", ""),
+    }
+
+
+def summarize_debian(entry, cve_id):
+    if not entry:
+        return None
+    d = entry["data"]
+    releases = []
+    for suite, info in (d.get("releases") or {}).items():
+        releases.append({"suite": suite, "status": info.get("status"),
+                         "fixed_version": info.get("fixed_version"),
+                         "urgency": info.get("urgency")})
+    releases.sort(key=lambda r: r["suite"])
+    return {"package": entry["package"], "scope": d.get("scope"),
+            "releases": releases, "link": DEBIAN_CVE_PAGE % cve_id}
+
+
+def summarize_archlinux(rec, cve_id):
+    if not rec:
+        return None
+    group = rec.get("group_info") or {}
+    return {"severity": rec.get("severity"), "type": rec.get("type"),
+            "status": group.get("status"), "affected": group.get("affected"),
+            "fixed": group.get("fixed"),
+            "advisories": rec.get("advisories") or [],
+            "link": ARCH_CVE_PAGE % cve_id}
+
+
+def summarize_osv(osv):
+    if not osv:
+        return None
+    score = None
+    for s in osv.get("severity") or []:
+        if str(s.get("type", "")).upper().startswith("CVSS"):
+            score = s.get("score")
+            break
+    return {"related": osv.get("related") or [], "cvss_vector": score,
+            "link": OSV_PAGE % osv.get("id", "")}
+
+
+def summarize_exploitdb(rows):
+    if rows is None:
+        return None
+    out = []
+    for row in rows or []:
+        desc = row.get("description") or [None, None]
+        out.append({
+            "edb_id": row.get("id"),
+            "title": desc[1] if len(desc) > 1 else None,
+            "date": row.get("date_published"),
+            "type": _dig(row, "type", "display"),
+            "verified": bool(row.get("verified")),
+            "link": EXPLOITDB_EXPLOIT_PAGE % row.get("id", ""),
+        })
+    return out
+
+
 def parse_cpe_ranges(cvelist):
     ranges = []
     containers = [_dig(cvelist, "containers", "cna", default={}) or {}]
@@ -706,7 +888,7 @@ def _title_from_desc(desc):
 # Build record
 # --------------------------------------------------------------------------- #
 
-def build_record(cve_id, fetch_diffs=True):
+def build_record(cve_id, fetch_diffs=True, fetch_vendor=True):
     cve_id = cve_id.upper()
     sys.stderr.write("[*] %s: fetching cvelistV5 record ...\n" % cve_id)
     cvelist = fetch_cvelist(cve_id)
@@ -724,6 +906,20 @@ def build_record(cve_id, fetch_diffs=True):
     nvd = fetch_nvd(cve_id)
     epss = fetch_epss(cve_id)
     kev = fetch_kev(cve_id)
+
+    redhat = archlinux = osv = exploitdb = debian = lkc = None
+    if fetch_vendor:
+        sys.stderr.write("[*] fetching Red Hat / Arch / OSV / Exploit-DB ...\n")
+        redhat = summarize_redhat(fetch_redhat(cve_id))
+        archlinux = summarize_archlinux(fetch_archlinux(cve_id), cve_id)
+        osv = summarize_osv(fetch_osv(cve_id))
+        exploitdb = summarize_exploitdb(fetch_exploitdb(cve_id))
+        if is_kernel:
+            sys.stderr.write(
+                "[*] fetching Debian tracker / linuxkernelcves.com "
+                "(cached, first run may be slow) ...\n")
+            debian = summarize_debian(fetch_debian_entry(cve_id), cve_id)
+            lkc = fetch_linuxkernelcves(cve_id)
 
     desc = ""
     for d in cna.get("descriptions", []) or []:
@@ -819,6 +1015,18 @@ def build_record(cve_id, fetch_diffs=True):
     sources.append("CISA KEV" if kev else "CISA KEV (not listed)")
     if patches:
         sources.append("git.kernel.org (commits)")
+    if redhat:
+        sources.append("Red Hat Security Data API")
+    if archlinux:
+        sources.append("Arch Linux Security Tracker")
+    if osv:
+        sources.append("OSV.dev")
+    if exploitdb is not None:
+        sources.append("Exploit-DB")
+    if debian:
+        sources.append("Debian Security Tracker")
+    if lkc:
+        sources.append("linuxkernelcves.com")
 
     return {
         "cve_id": cve_id, "title": title, "assigner": assigner,
@@ -836,6 +1044,10 @@ def build_record(cve_id, fetch_diffs=True):
         "versions": versions, "cpe_ranges": cpe,
         "references": refs, "patches": patches, "sources_used": sources,
         "nvd_status": nvd.get("vulnStatus") if nvd else "Not in NVD",
+        "redhat": redhat, "archlinux": archlinux, "osv": osv,
+        "exploitdb": exploitdb, "debian": debian, "lkc": lkc,
+        "ubuntu_link": UBUNTU_CVE_PAGE % cve_id if fetch_vendor else None,
+        "suse_link": SUSE_CVE_PAGE % cve_id if fetch_vendor else None,
         "generated_at": datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"),
     }
@@ -907,6 +1119,16 @@ def render_markdown(r):
             r["ssvc"].get("exploitation"), r["ssvc"].get("automatable"),
             r["ssvc"].get("technical_impact")))
     a("| NVD status | %s |" % r["nvd_status"])
+    if r.get("lkc") and r["lkc"].get("name"):
+        a("| Known as | **%s** |" % r["lkc"]["name"])
+    edb = r.get("exploitdb")
+    if edb:
+        top = edb[0]
+        a("| Public exploit | ⚠️ **[Exploit-DB EDB-ID %s](%s)**%s |" % (
+            top["edb_id"], top["link"],
+            (" — %s" % top["title"]) if top.get("title") else ""))
+    elif edb is not None:
+        a("| Public exploit | not listed on Exploit-DB |")
     a("")
 
     # 2. affected component
@@ -1077,8 +1299,83 @@ def render_markdown(r):
                 a("- %s" % u)
             a("")
 
-    # 8. provenance
-    a("## 8. Provenance")
+    # 8. vendor / distro cross-references
+    rh, arch, deb, osv = r.get("redhat"), r.get("archlinux"), \
+        r.get("debian"), r.get("osv")
+    lkc = r.get("lkc")
+    if any((rh, arch, deb, osv, r.get("ubuntu_link"), r.get("suse_link"))):
+        a("## 8. Vendor & distro cross-references")
+        a("")
+        a("| Tracker | Status | Notes | Link |")
+        a("|---|---|---|---|")
+        if rh:
+            advs = ", ".join("[%s](https://access.redhat.com/errata/%s)"
+                             % (x["id"], x["id"]) for x in rh["advisories"][:3])
+            more = " (+%d more)" % (len(rh["advisories"]) - 3) \
+                if len(rh["advisories"]) > 3 else ""
+            a("| Red Hat | %s%s | %s%s | %s |" % (
+                rh.get("severity") or "—",
+                (" (CVSS3 %s)" % rh["cvss3_score"]) if rh.get("cvss3_score")
+                else "",
+                advs or "no RHSA advisory on file", more, rh["link"]))
+        else:
+            a("| Red Hat | not tracked | — | %s |" % (REDHAT_CVE_PAGE % r["cve_id"]))
+        if deb:
+            resolved = [x for x in deb["releases"] if x["status"] == "resolved"]
+            open_ = [x for x in deb["releases"] if x["status"] != "resolved"]
+            bits = []
+            if resolved:
+                bits.append("fixed: %s" % ", ".join(
+                    "%s (%s)" % (x["suite"], x["fixed_version"] or "?")
+                    for x in resolved))
+            if open_:
+                bits.append("open: %s" % ", ".join(x["suite"] for x in open_))
+            a("| Debian | %s package | %s | %s |" % (
+                deb["package"], "; ".join(bits) or "no per-suite data",
+                deb["link"]))
+        elif r["is_kernel"]:
+            a("| Debian | not tracked | — | %s |" % (DEBIAN_CVE_PAGE % r["cve_id"]))
+        else:
+            a("| Debian | — | not queried (non-kernel CVE) | %s |"
+              % (DEBIAN_CVE_PAGE % r["cve_id"]))
+        a("| Ubuntu | — | not queried live (no reliable per-CVE API) | %s |"
+          % (r.get("ubuntu_link") or "—"))
+        a("| SUSE | — | not queried live (no public API, HTML only) | %s |"
+          % (r.get("suse_link") or "—"))
+        if arch:
+            status = arch.get("status") or ("tracked" if arch.get("severity")
+                                            else "—")
+            fix = (" — fixed %s" % arch["fixed"]) if arch.get("fixed") else ""
+            a("| Arch Linux | %s%s | severity: %s | %s |" % (
+                status, fix, arch.get("severity") or "—", arch["link"]))
+        else:
+            a("| Arch Linux | not tracked | — | — |")
+        if osv:
+            rel = ", ".join(osv["related"][:5]) if osv["related"] else \
+                "no related advisories listed"
+            a("| OSV.dev | tracked | %s | %s |" % (rel, osv["link"]))
+        else:
+            a("| OSV.dev | not tracked | — | %s |" % (OSV_PAGE % r["cve_id"]))
+        a("")
+        if lkc:
+            bits = []
+            if lkc.get("affected_versions"):
+                bits.append("affected %s" % lkc["affected_versions"])
+            if lkc.get("last_affected_version"):
+                bits.append("last known-vulnerable release %s" %
+                            lkc["last_affected_version"])
+            if bits:
+                a("_Community cross-check (linuxkernelcves.com, "
+                  "no accuracy guarantee):_ %s." % "; ".join(bits))
+                a("")
+        if rh and rh.get("mitigation"):
+            a("**Red Hat mitigation notes:**")
+            a("")
+            a("> %s" % rh["mitigation"].replace("\n", "\n> "))
+            a("")
+
+    # 9. provenance
+    a("## 9. Provenance")
     a("")
     a("- Data sources: %s" % ", ".join(r["sources_used"]))
     a("- Version mapping: %s" % v.get("source", "—"))
@@ -1119,13 +1416,17 @@ def main(argv=None):
                     help="print only the JSON data pack to stdout")
     ap.add_argument("--no-diff", action="store_true",
                     help="skip fetching commit patches (faster, less detail)")
+    ap.add_argument("--no-vendor", action="store_true",
+                    help="skip Red Hat/Debian/Arch/OSV/Exploit-DB lookups "
+                         "(faster, less detail)")
     args = ap.parse_args(argv)
 
     cve = args.cve.strip().upper()
     if not CVE_RE.match(cve):
         ap.error("invalid CVE id: %s (expected CVE-YYYY-NNNNN)" % args.cve)
 
-    record = build_record(cve, fetch_diffs=not args.no_diff)
+    record = build_record(cve, fetch_diffs=not args.no_diff,
+                          fetch_vendor=not args.no_vendor)
 
     if args.json_only:
         sys.stdout.write(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
