@@ -19,6 +19,13 @@ Data sources (all official / trusted):
   * linuxkernelcves.com data  (colloquial vuln name, affected/last-vulnerable version)
   * Exploit-DB                (public PoC-exploit availability)
   * Ubuntu / SUSE             (reference links only -- no public per-CVE API)
+  * Feedly.dev CVE pages      (cross-outlet media coverage aggregator)
+  * thehackerwire.com         (per-CVE tracker page, embedded structured data)
+  * thehackernews.com         (full-archive search, Blogger feed API)
+  * cybersecuritynews.com     (WordPress REST API search)
+  * securityonline.info       (WordPress REST API search)
+  * Qualys blog / BleepingComputer (reference links only -- both block/lock
+                                     out no-auth automated lookups)
 
 Optimized for Linux-kernel (kernel.org CNA) CVEs. The per-branch fix->release
 mapping comes from the kernel security team's own dyad file, which authoritatively
@@ -32,6 +39,7 @@ Usage:
     python3 cve_report.py CVE-2026-53359 -o /path/out.md
     python3 cve_report.py CVE-2026-53359 --no-diff         # skip commit patches
     python3 cve_report.py CVE-2026-53359 --no-vendor       # skip vendor/distro lookups
+    python3 cve_report.py CVE-2026-53359 --no-media        # skip media/community lookups
 
 No third-party dependencies (stdlib only). Set NVD_API_KEY to raise NVD limits.
 """
@@ -46,6 +54,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -75,6 +84,20 @@ EXPLOITDB_SEARCH = "https://www.exploit-db.com/search?cve=%s"
 EXPLOITDB_EXPLOIT_PAGE = "https://www.exploit-db.com/exploits/%s"
 UBUNTU_CVE_PAGE = "https://ubuntu.com/security/%s"
 SUSE_CVE_PAGE = "https://www.suse.com/security/cve/%s.html"
+
+# media / community coverage sources (verified empirically -- see
+# fetch_feedly/fetch_hackerwire/fetch_hackernews_coverage/fetch_wp_coverage)
+FEEDLY_CVE_PAGE = "https://feedly.com/cve/%s"
+HACKERWIRE_VULN_PAGE = "https://www.thehackerwire.com/vulnerability/%s/"
+HACKERNEWS_FEED_SEARCH = "https://thehackernews.com/feeds/posts/default?q=%s&alt=json"
+CYBERSECURITYNEWS_BASE = "https://cybersecuritynews.com"
+SECURITYONLINE_BASE = "https://securityonline.info"
+QUALYS_BLOG_PAGE = "https://blog.qualys.com/"
+BLEEPINGCOMPUTER_SEARCH_PAGE = "https://www.bleepingcomputer.com/search/?q=%s"
+# redirect blobs / social mirrors in Feedly's chatter list that aren't a
+# real article a reader could usefully click through to
+FEEDLY_NOISY_CHATTER_HOSTS = ("news.google.com", "nitter.net", "t.co",
+                             "twitter.com", "x.com")
 
 # tokens that appear in diff hunk context but are NOT the changed function
 NOT_A_FUNCTION = re.compile(
@@ -355,6 +378,119 @@ def fetch_exploitdb(cve_id):
     if data is None:
         return None
     return data.get("data") or []
+
+
+def fetch_wp_coverage(base, cve_id, colloquial_name=None, limit=3):
+    """Generic WordPress REST API search (no auth, no scraping) used for
+    cybersecuritynews.com and securityonline.info. Tries the bare CVE ID
+    first, then the colloquial vuln name if that yields nothing. Returns
+    [] on a confirmed no-hit search, None if the site couldn't be reached
+    at all."""
+    reached = False
+    for term in [t for t in (cve_id, colloquial_name) if t]:
+        url = "%s/wp-json/wp/v2/posts?search=%s" % (
+            base, urllib.parse.quote(term))
+        data = _http_json(url, timeout=15)
+        if data is None:
+            continue
+        reached = True
+        out = []
+        for post in data[:limit]:
+            out.append({"title": _dig(post, "title", "rendered"),
+                       "url": post.get("link"), "date": post.get("date")})
+        if out:
+            return out
+    return [] if reached else None
+
+
+def fetch_hackernews_coverage(cve_id, colloquial_name=None, limit=3):
+    """thehackernews.com (Blogger-hosted): full-archive keyword search via
+    Blogger's public GData feed API. Returns [] on a confirmed no-hit
+    search, None if the feed couldn't be reached at all."""
+    reached = False
+    for term in [t for t in (cve_id, colloquial_name) if t]:
+        url = HACKERNEWS_FEED_SEARCH % urllib.parse.quote(term)
+        data = _http_json(url, timeout=15)
+        if data is None:
+            continue
+        reached = True
+        entries = _dig(data, "feed", "entry", default=[]) or []
+        out = []
+        for e in entries[:limit]:
+            link = next((l.get("href") for l in e.get("link", [])
+                        if l.get("rel") == "alternate"), None)
+            out.append({"title": _dig(e, "title", "$t"), "url": link,
+                       "date": _dig(e, "published", "$t")})
+        if out:
+            return out
+    return [] if reached else None
+
+
+def fetch_hackerwire(cve_id):
+    """thehackerwire.com auto-generated CVE tracker page: extract the
+    embedded JSON-LD (schema.org TechArticle) rather than scraping prose.
+    The page returns HTTP 200 even for unknown CVEs (a client-side loading
+    stub with no ld+json block), so absence of that block means "not
+    tracked", not a fetch error."""
+    html = _http_text(HACKERWIRE_VULN_PAGE % cve_id, timeout=15)
+    if not html:
+        return None
+    m = re.search(r'<script type="application/ld\+json">(.*?)</script>',
+                 html, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return None
+    graph = data.get("@graph") if isinstance(data, dict) else None
+    art = next((g for g in graph or [] if g.get("@type") == "TechArticle"),
+              None)
+    if not art:
+        return None
+    return {"headline": art.get("headline"), "description": art.get("description"),
+            "date": art.get("datePublished"),
+            "url": HACKERWIRE_VULN_PAGE % cve_id}
+
+
+def fetch_feedly(cve_id):
+    """feedly.com/cve/<id>: server-side-rendered Next.js page; extract the
+    __NEXT_DATA__ JSON blob (a single well-defined embedded object, not
+    prose scraping) for cross-outlet media coverage aggregation."""
+    html = _http_text(FEEDLY_CVE_PAGE % cve_id, timeout=20)
+    if not html:
+        return None
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                 html, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return None
+    pp = _dig(data, "props", "pageProps", default={}) or {}
+    cve_info = pp.get("cveInfo") or {}
+    if not cve_info:
+        return None
+    chatter = []
+    for c in pp.get("chatterEntries") or []:
+        link = c.get("sourceLink")
+        if not link:
+            continue
+        host = urllib.parse.urlparse(link).netloc.lower()
+        if any(h in host for h in FEEDLY_NOISY_CHATTER_HOSTS):
+            continue  # redirect blobs / social mirrors, not a real article
+        chatter.append({"title": c.get("title"), "url": link})
+        if len(chatter) >= 5:
+            break
+    return {
+        "cvss_estimate": cve_info.get("cvssCategoryEstimate"),
+        "trending": cve_info.get("trending"),
+        "patched": cve_info.get("patched"),
+        "total_chatter": pp.get("totalChatterEntries"),
+        "chatter": chatter,
+        "link": FEEDLY_CVE_PAGE % cve_id,
+    }
 
 
 def _unfold_headers(text):
@@ -888,7 +1024,7 @@ def _title_from_desc(desc):
 # Build record
 # --------------------------------------------------------------------------- #
 
-def build_record(cve_id, fetch_diffs=True, fetch_vendor=True):
+def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
     cve_id = cve_id.upper()
     sys.stderr.write("[*] %s: fetching cvelistV5 record ...\n" % cve_id)
     cvelist = fetch_cvelist(cve_id)
@@ -920,6 +1056,21 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True):
                 "(cached, first run may be slow) ...\n")
             debian = summarize_debian(fetch_debian_entry(cve_id), cve_id)
             lkc = fetch_linuxkernelcves(cve_id)
+
+    feedly = hackerwire = None
+    hackernews_coverage = csn_coverage = dcs_coverage = None
+    if fetch_media:
+        sys.stderr.write(
+            "[*] fetching media/community coverage (Feedly, Hacker Wire, "
+            "Hacker News, CyberSecurityNews, SecurityOnline) ...\n")
+        colloquial = lkc.get("name") if lkc else None
+        feedly = fetch_feedly(cve_id)
+        hackerwire = fetch_hackerwire(cve_id)
+        hackernews_coverage = fetch_hackernews_coverage(cve_id, colloquial)
+        csn_coverage = fetch_wp_coverage(
+            CYBERSECURITYNEWS_BASE, cve_id, colloquial)
+        dcs_coverage = fetch_wp_coverage(
+            SECURITYONLINE_BASE, cve_id, colloquial)
 
     desc = ""
     for d in cna.get("descriptions", []) or []:
@@ -1027,6 +1178,16 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True):
         sources.append("Debian Security Tracker")
     if lkc:
         sources.append("linuxkernelcves.com")
+    if feedly:
+        sources.append("Feedly.com")
+    if hackerwire:
+        sources.append("The Hacker Wire")
+    if hackernews_coverage is not None:
+        sources.append("The Hacker News")
+    if csn_coverage is not None:
+        sources.append("CyberSecurityNews.com")
+    if dcs_coverage is not None:
+        sources.append("SecurityOnline.info")
 
     return {
         "cve_id": cve_id, "title": title, "assigner": assigner,
@@ -1048,6 +1209,14 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True):
         "exploitdb": exploitdb, "debian": debian, "lkc": lkc,
         "ubuntu_link": UBUNTU_CVE_PAGE % cve_id if fetch_vendor else None,
         "suse_link": SUSE_CVE_PAGE % cve_id if fetch_vendor else None,
+        "feedly": feedly, "hackerwire": hackerwire,
+        "hackernews_coverage": hackernews_coverage,
+        "cybersecuritynews_coverage": csn_coverage,
+        "securityonline_coverage": dcs_coverage,
+        "qualys_blog_link": QUALYS_BLOG_PAGE if fetch_media else None,
+        "bleepingcomputer_search_link":
+            BLEEPINGCOMPUTER_SEARCH_PAGE % urllib.parse.quote(cve_id)
+            if fetch_media else None,
         "generated_at": datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"),
     }
@@ -1300,12 +1469,15 @@ def render_markdown(r):
             a("")
 
     # 8. vendor / distro cross-references
+    a("## 8. Vendor & distro cross-references")
+    a("")
     rh, arch, deb, osv = r.get("redhat"), r.get("archlinux"), \
         r.get("debian"), r.get("osv")
     lkc = r.get("lkc")
-    if any((rh, arch, deb, osv, r.get("ubuntu_link"), r.get("suse_link"))):
-        a("## 8. Vendor & distro cross-references")
+    if r.get("ubuntu_link") is None:
+        a("_Skipped (--no-vendor)._")
         a("")
+    else:
         a("| Tracker | Status | Notes | Link |")
         a("|---|---|---|---|")
         if rh:
@@ -1374,8 +1546,69 @@ def render_markdown(r):
             a("> %s" % rh["mitigation"].replace("\n", "\n> "))
             a("")
 
-    # 9. provenance
-    a("## 9. Provenance")
+    # 9. media & community coverage
+    a("## 9. Media & community coverage")
+    a("")
+    feedly, hackerwire = r.get("feedly"), r.get("hackerwire")
+    hn_hits = r.get("hackernews_coverage")
+    csn_hits = r.get("cybersecuritynews_coverage")
+    dcs_hits = r.get("securityonline_coverage")
+    if r.get("qualys_blog_link") is None:
+        a("_Skipped (--no-media)._")
+        a("")
+    else:
+        if feedly:
+            bits = []
+            if feedly.get("cvss_estimate"):
+                bits.append("CVSS estimate: %s" % feedly["cvss_estimate"])
+            if feedly.get("trending"):
+                bits.append("trending")
+            if feedly.get("total_chatter") is not None:
+                bits.append("%s tracked mention(s)" % feedly["total_chatter"])
+            a("**[Feedly aggregator](%s)** — %s" % (
+                feedly["link"], ", ".join(bits) or "tracked"))
+            for c in feedly.get("chatter") or []:
+                a("- [%s](%s)" % (c.get("title") or c["url"], c["url"]))
+            a("")
+
+        def _fmt_hits(hits):
+            return "; ".join("[%s](%s)" % (h["title"], h["url"])
+                             for h in hits[:2] if h.get("url"))
+
+        rows = []
+        if hackerwire:
+            rows.append(("The Hacker Wire (CVE tracker)",
+                        "[%s](%s)" % (hackerwire.get("headline")
+                                     or "tracked", hackerwire["url"])))
+        if hn_hits:
+            rows.append(("The Hacker News", _fmt_hits(hn_hits)))
+        elif hn_hits is not None:
+            rows.append(("The Hacker News", "no coverage found"))
+        if csn_hits:
+            rows.append(("CyberSecurityNews.com", _fmt_hits(csn_hits)))
+        elif csn_hits is not None:
+            rows.append(("CyberSecurityNews.com", "no coverage found"))
+        if dcs_hits:
+            rows.append(("SecurityOnline.info", _fmt_hits(dcs_hits)))
+        elif dcs_hits is not None:
+            rows.append(("SecurityOnline.info", "no coverage found"))
+        if rows:
+            a("| Outlet | Coverage |")
+            a("|---|---|")
+            for name, val in rows:
+                a("| %s | %s |" % (name, val))
+            a("")
+        if r.get("qualys_blog_link") or r.get("bleepingcomputer_search_link"):
+            a("_Not queried live (no reliable no-auth API): "
+              "[Qualys TRU blog](%s), [BleepingComputer](%s) "
+              "(blocks non-browser requests) -- check manually._" % (
+                  r.get("qualys_blog_link") or QUALYS_BLOG_PAGE,
+                  r.get("bleepingcomputer_search_link")
+                  or (BLEEPINGCOMPUTER_SEARCH_PAGE % r["cve_id"])))
+            a("")
+
+    # 10. provenance
+    a("## 10. Provenance")
     a("")
     a("- Data sources: %s" % ", ".join(r["sources_used"]))
     a("- Version mapping: %s" % v.get("source", "—"))
@@ -1419,6 +1652,9 @@ def main(argv=None):
     ap.add_argument("--no-vendor", action="store_true",
                     help="skip Red Hat/Debian/Arch/OSV/Exploit-DB lookups "
                          "(faster, less detail)")
+    ap.add_argument("--no-media", action="store_true",
+                    help="skip Feedly/Hacker Wire/Hacker News/community "
+                         "media coverage lookups (faster, less detail)")
     args = ap.parse_args(argv)
 
     cve = args.cve.strip().upper()
@@ -1426,7 +1662,8 @@ def main(argv=None):
         ap.error("invalid CVE id: %s (expected CVE-YYYY-NNNNN)" % args.cve)
 
     record = build_record(cve, fetch_diffs=not args.no_diff,
-                          fetch_vendor=not args.no_vendor)
+                          fetch_vendor=not args.no_vendor,
+                          fetch_media=not args.no_media)
 
     if args.json_only:
         sys.stdout.write(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
