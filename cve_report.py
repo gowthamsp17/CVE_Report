@@ -42,6 +42,12 @@ Usage:
     python3 cve_report.py CVE-2026-53359 --no-media        # skip media/community lookups
 
 No third-party dependencies (stdlib only). Set NVD_API_KEY to raise NVD limits.
+
+Report writing is delegated to a local zLLM proxy (OpenAI-compatible;
+see `zllm start`). Configure with:
+    ZLLM_BASE_URL   default http://127.0.0.1:8787/v1
+    ZLLM_API_KEY    default "unused" (proxy ignores it unless --api-key was set)
+    ZLLM_MODEL      default gpt-5.4
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ import gzip
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -67,6 +74,69 @@ KERNEL_GIT = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
 VULNS_GIT = "https://git.kernel.org/pub/scm/linux/security/vulns.git"
 CACHE_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "cve_report_cache")
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+
+# local Linux source tree + .config files, used to resolve per-branch module
+# info (via find_module_new.py) and, when a commit is present locally, to
+# read patch/commit details from `git show` instead of git.kernel.org.
+LINUX_SRC_DEFAULT = os.path.expanduser("~/Linux_Stable/linux")
+CONFIGS_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+MODULE_RESOLVE_BRANCHES = ["linux-5.10.y", "linux-6.1.y", "linux-6.12.y"]
+
+# fleet module-usage reporting script (internal tool, not part of this repo):
+# given a kernel module name, reports how widely it's loaded across the
+# fleet (per-region IP counts, ZServices, server types, kernel versions).
+MODULE_STATS_SCRIPT_DEFAULT = os.path.expanduser(
+    "~/Server-Modules/Scripts/module_stats.py")
+
+# local zLLM proxy (OpenAI-compatible; run `zllm start` beforehand)
+ZLLM_BASE_URL = os.environ.get("ZLLM_BASE_URL", "http://127.0.0.1:8787/v1")
+ZLLM_API_KEY = os.environ.get("ZLLM_API_KEY", "unused")
+ZLLM_MODEL = os.environ.get("ZLLM_MODEL", "gpt-5.4")
+ZLLM_REPORT_SYSTEM_PROMPT = (
+    "You are a senior Linux kernel security analyst. You write detailed, "
+    "precise CVE reports in Markdown for a technical security audience. "
+    "You are given a JSON data pack collected from authoritative sources "
+    "(cvelistV5, kernel vulns.git, NVD, EPSS, CISA KEV, git.kernel.org, "
+    "Debian, Exploit-DB, and media coverage). "
+    "Use ONLY the facts present in that JSON -- never invent CVE numbers, "
+    "commits, versions, scores, or links that are not in the data. If a "
+    "field is missing or null, say so plainly instead of guessing. "
+    "Write clean, well-structured Markdown with headings, tables, and "
+    "bullet lists as appropriate; do not wrap the whole answer in a code "
+    "fence."
+)
+ZLLM_REPORT_USER_TEMPLATE = (
+    "Write a complete, detailed CVE report in Markdown for %s using only "
+    "the JSON data pack below. Structure it with these sections in order: "
+    "1. At a glance (key facts table: CVSS, CWE, EPSS, CISA KEV/SSVC, NVD "
+    "status, public exploit availability), 2. Affected component (product, "
+    "subsystem, module, files, functions, kernel config; if the JSON has a "
+    "'module_by_branch' field, include a per-branch/per-config module "
+    "resolution table with columns Branch | File | CONFIG_ symbol "
+    "| Result (no Config column; configs of the same branch give the same "
+    "result, so emit one row per branch+file, deduplicated across "
+    "versions), using exactly that data -- this tells you which .ko module "
+    "or vmlinux the file builds into for each stable branch/config), "
+    "3. Affected & "
+    "fixed versions (introduced version/commit, per-branch fixed releases "
+    "table including each commit's date, EOL/unfixed branches), "
+    "3b. Fleet exposure (only if the JSON has a 'module_stats' field: for "
+    "each module name, render its 'rows' list as a table with columns "
+    "Region | Total IPs | Loaded | ZServices | VMs | Phys Srv | KVM Host | "
+    "Cont Host | Containers, using exactly that per-region data, one row "
+    "per entry including the 'All regions' aggregate row), "
+    "4. Vulnerability details (weakness class and the upstream description), "
+    "5. The fix (mainline commit, subject, author, date, diffstat, patch "
+    "link, plus a stable-backports table with columns Branch | Commit | "
+    "Date | Patch link -- always include the commit date column, taken "
+    "from each patch's 'date' field in the JSON), 6. Mitigations & detection, "
+    "7. References (grouped by commits/CVE records/discussion/advisories/"
+    "other), 8. Debian (package, link, per-suite status/fixed version table; "
+    "do NOT include Red Hat, Ubuntu, SUSE, Arch or OSV sections), 9. Media & community coverage, "
+    "10. Provenance (data sources used, version-mapping source, generation "
+    "timestamp). Omit any section entirely if the data pack has nothing "
+    "for it.\n\nJSON data pack:\n```json\n%s\n```"
+)
 
 # vendor / distro / aggregator sources (verified empirically: no auth, no API
 # key, stdlib-fetchable -- see fetch_redhat/fetch_archlinux/fetch_osv/etc.)
@@ -185,6 +255,47 @@ def _http_json(url, timeout=30, headers=None):
 def _http_text(url, timeout=30, headers=None):
     raw = _http(url, timeout=timeout, headers=headers)
     return raw.decode("utf-8", "replace") if raw else None
+
+
+def llm_chat(system, user, model=None, timeout=180, temperature=0.2):
+    """Call the local zLLM OpenAI-compatible proxy's /chat/completions and
+    return the assistant's message content. Raises SystemExit with a clear,
+    actionable message on any failure (proxy down, auth, bad response) --
+    by design there is no silent template fallback."""
+    url = ZLLM_BASE_URL.rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": model or ZLLM_MODEL,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer %s" % ZLLM_API_KEY,
+                 "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        raise SystemExit(
+            "ERROR: zLLM request failed (%s %s) at %s.\n%s\n"
+            "       Is the proxy running? Try: zllm start"
+            % (e.code, e.reason, url, detail[:500]))
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(
+            "ERROR: could not reach zLLM proxy at %s (%s).\n"
+            "       Is the proxy running? Try: zllm start" % (url, e))
+    choices = data.get("choices") or []
+    content = _dig(choices[0], "message", "content") if choices else None
+    if not content or not content.strip():
+        raise SystemExit(
+            "ERROR: zLLM proxy returned an empty response.\n%s"
+            % json.dumps(data, indent=2)[:1000])
+    return content.strip()
 
 
 def _cached(name, ttl, producer):
@@ -505,8 +616,91 @@ def _unfold_headers(text):
     return "\n".join(out)
 
 
-def fetch_patch(commit):
-    """Fetch a commit patch from git.kernel.org; parse headers + per-file hunks."""
+def _fetch_patch_local(commit, linux_src):
+    """Read a commit's patch straight out of a local Linux git checkout via
+    `git show`, instead of hitting git.kernel.org. Returns the same shape as
+    fetch_patch(), or None if the tree/commit isn't available locally."""
+    if not linux_src or not os.path.isdir(os.path.join(linux_src, ".git")):
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "show", "--pretty=fuller", "--date=default", commit],
+            cwd=linux_src, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    raw = proc.stdout
+
+    out = {
+        "commit": commit, "raw_url": None,
+        "web_url": "https://git.kernel.org/stable/c/%s" % commit,
+        "author": None, "date": None, "subject": None, "body": None,
+        "files": [], "functions": [], "insertions": 0, "deletions": 0,
+    }
+    header, _, diff_part = raw.partition("\ndiff --git")
+    diff_part = ("diff --git" + diff_part) if diff_part else ""
+
+    m = re.search(r"^Author:\s*(.+)$", header, re.MULTILINE)
+    if m:
+        out["author"] = m.group(1).strip()
+    m = re.search(r"^AuthorDate:\s*(.+)$", header, re.MULTILINE)
+    if m:
+        out["date"] = m.group(1).strip()
+
+    lines = header.split("\n")
+    body_lines, in_body = [], False
+    for line in lines:
+        if not in_body:
+            if line.startswith("commit ") or re.match(
+                    r"^(Author|AuthorDate|Commit|CommitDate):", line):
+                continue
+            if line.strip() == "" and not body_lines:
+                in_body = True
+                continue
+            continue
+        body_lines.append(line)
+    # strip the leading 4-space indent git show applies to commit message
+    body_lines = [ln[4:] if ln.startswith("    ") else ln for ln in body_lines]
+    body_text = "\n".join(body_lines).strip()
+    if body_text:
+        subject, _, rest = body_text.partition("\n")
+        out["subject"] = subject.strip()
+        out["body"] = rest.strip() or None
+
+    out["files"] = re.findall(r"^diff --git a/(\S+) b/\S+", diff_part, re.MULTILINE)
+    dm = re.search(r"(\d+) insertion", raw)
+    if dm:
+        out["insertions"] = int(dm.group(1))
+    dm = re.search(r"(\d+) deletion", raw)
+    if dm:
+        out["deletions"] = int(dm.group(1))
+
+    funcs, cur_src = [], False
+    for line in diff_part.split("\n"):
+        dg = re.match(r"^diff --git a/(\S+) b/", line)
+        if dg:
+            cur_src = dg.group(1).endswith((".c", ".S"))
+            continue
+        if cur_src and line.startswith("@@"):
+            hm = re.match(r"^@@ [^@]*@@\s*(.+)$", line)
+            if hm:
+                fn = _func_from_context(hm.group(1))
+                if fn:
+                    funcs.append(fn)
+    seen = set()
+    out["functions"] = [f for f in funcs if not (f in seen or seen.add(f))]
+    return out
+
+
+def fetch_patch(commit, linux_src=None):
+    """Fetch a commit patch, preferring a local Linux source tree (`git
+    show`, no network) over git.kernel.org when linux_src is given and has
+    the commit; parse headers + per-file hunks either way."""
+    local = _fetch_patch_local(commit, linux_src)
+    if local:
+        return local
     url = "%s/patch/?id=%s" % (KERNEL_GIT, commit)
     raw = _http_text(url, timeout=30)
     if not raw:
@@ -632,6 +826,127 @@ def _makefile_for(filepath):
     seen = set()
     result["config"] = [c for c in result["config"]
                         if not (c in seen or seen.add(c))]
+    return result
+
+
+def _module_names_from_resolution(module_by_branch, modules=None):
+    """Collect distinct .ko module basenames (no path, no extension) out of
+    resolve_modules_by_branch()'s per-branch/per-config results, plus any
+    names already known from fetch_makefile_config()."""
+    names = list(modules or [])
+    for branch_entries in (module_by_branch or {}).values():
+        for cfg_entry in branch_entries:
+            for fe in cfg_entry.get("files", []):
+                m = re.search(r"([A-Za-z0-9_\-]+)\.ko\b", fe.get("result") or "")
+                if m and m.group(1) not in names:
+                    names.append(m.group(1))
+    return names
+
+
+_MODULE_STATS_ROW_RE = re.compile(
+    r"^\s*(.+?)\s{2,}(\d+)\s+(\d+)\s+([\d.]+)%\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$")
+
+
+def fetch_module_stats(module, script_path=MODULE_STATS_SCRIPT_DEFAULT, timeout=60):
+    """Run the fleet module_stats.py tool's --brief text report for a single
+    module name and parse the per-region summary table (Region, Total IPs,
+    Loaded, Loaded %, ZServices, VMs, Phys Srv, KVM Host, Cont Host,
+    Containers). Returns None if the script is missing, times out, or the
+    module isn't tracked in any region's matrix."""
+    if not script_path or not os.path.isfile(script_path):
+        return None
+    try:
+        proc = subprocess.run(
+            [script_path, module, "--brief"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    rows = []
+    for line in proc.stdout.splitlines():
+        m = _MODULE_STATS_ROW_RE.match(line)
+        if not m:
+            continue
+        region, total, loaded, _pct, zsvc, vms, phys, kvm, cont_host, containers = m.groups()
+        rows.append({
+            "region": region.strip(), "total_ips": int(total), "loaded": int(loaded),
+            "zservices": int(zsvc), "vms": int(vms), "phys_srv": int(phys),
+            "kvm_host": int(kvm), "cont_host": int(cont_host),
+            "containers": int(containers),
+        })
+    if not rows:
+        return None
+    return {"module": module, "rows": rows}
+
+
+def resolve_modules_by_branch(files, linux_src, configs_dir,
+                               branches=MODULE_RESOLVE_BRANCHES):
+    """For each affected source file, resolve which module (.ko) or vmlinux
+    it builds into, per stable branch (5.10.y/6.1.y/6.12.y) and per matching
+    .config file found in configs_dir -- using find_module_new.py's
+    Makefile/Kconfig resolution against a throwaway git worktree of that
+    branch (the caller's checkout at linux_src is left untouched).
+    Returns {branch: [{"config": name, "files": [{"file", "config_symbol",
+    "result"}, ...]}, ...]}."""
+    files = [f for f in (files or []) if f.endswith((".c", ".S", ".h"))]
+    if not files or not linux_src or not os.path.isdir(
+            os.path.join(linux_src, ".git")):
+        return {}
+    try:
+        import find_module_new as fm
+    except ImportError:
+        return {}
+
+    all_configs = []
+    if configs_dir and os.path.isdir(configs_dir):
+        all_configs = sorted(
+            os.path.join(configs_dir, f) for f in os.listdir(configs_dir)
+            if f.startswith("config-"))
+
+    def _configs_for_branch(branch):
+        m = re.match(r"linux-(\d+\.\d+)\.y", branch)
+        if not m:
+            return []
+        prefix = "config-%s." % m.group(1)
+        return [c for c in all_configs if os.path.basename(c).startswith(prefix)]
+
+    result = {}
+    for branch in branches:
+        cfgs = _configs_for_branch(branch)
+        if not cfgs:
+            continue
+        wt_path = fm._add_worktree(branch, linux_src)
+        if wt_path is None:
+            continue
+        try:
+            branch_out = []
+            for cfg_path in cfgs:
+                kernel_cfg = fm.load_kernel_config(cfg_path)
+                per_file = []
+                for f in files:
+                    try:
+                        outcome, raw_config, _, resolved_dir = fm.find_module(
+                            f, wt_path, config_path=cfg_path, kernel_cfg=kernel_cfg)
+                    except (FileNotFoundError, IsADirectoryError):
+                        continue
+                    directory = (os.path.relpath(resolved_dir, wt_path)
+                                 if resolved_dir else os.path.dirname(f))
+                    per_file.append({
+                        "file": f,
+                        "config_symbol": raw_config,
+                        "result": fm.format_outcome(outcome, raw_config, directory),
+                    })
+                if per_file:
+                    branch_out.append({
+                        "config": os.path.basename(cfg_path),
+                        "files": per_file,
+                    })
+            if branch_out:
+                result[branch] = branch_out
+        finally:
+            fm._remove_worktree(wt_path, linux_src)
     return result
 
 
@@ -1024,7 +1339,9 @@ def _title_from_desc(desc):
 # Build record
 # --------------------------------------------------------------------------- #
 
-def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
+def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
+                  linux_src=None, configs_dir=None, resolve_modules=True,
+                  fetch_module_stats_flag=True, module_stats_script=None):
     cve_id = cve_id.upper()
     sys.stderr.write("[*] %s: fetching cvelistV5 record ...\n" % cve_id)
     cvelist = fetch_cvelist(cve_id)
@@ -1045,10 +1362,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
 
     redhat = archlinux = osv = exploitdb = debian = lkc = None
     if fetch_vendor:
-        sys.stderr.write("[*] fetching Red Hat / Arch / OSV / Exploit-DB ...\n")
-        redhat = summarize_redhat(fetch_redhat(cve_id))
-        archlinux = summarize_archlinux(fetch_archlinux(cve_id), cve_id)
-        osv = summarize_osv(fetch_osv(cve_id))
+        sys.stderr.write("[*] fetching Exploit-DB ...\n")
         exploitdb = summarize_exploitdb(fetch_exploitdb(cve_id))
         if is_kernel:
             sys.stderr.write(
@@ -1132,7 +1446,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
         if want:
             sys.stderr.write("[*] fetching %d commit patch(es) ...\n" % len(want))
         for c in want:
-            p = fetch_patch(c)
+            p = fetch_patch(c, linux_src=linux_src)
             if p:
                 patches[c] = p
 
@@ -1156,6 +1470,26 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
         sys.stderr.write("[*] deriving module / CONFIG ...\n")
         modinfo = fetch_makefile_config(files)
 
+    # per-branch module resolution against a local Linux source tree +
+    # per-branch .config files (find_module_new.py's Makefile/Kconfig logic)
+    module_by_branch = {}
+    if files and is_kernel and resolve_modules and linux_src:
+        sys.stderr.write("[*] resolving module per branch/config (local source) ...\n")
+        module_by_branch = resolve_modules_by_branch(files, linux_src, configs_dir)
+
+    # fleet exposure: how widely is the affected module actually loaded
+    module_stats = {}
+    if fetch_module_stats_flag and module_stats_script:
+        candidate_modules = _module_names_from_resolution(
+            module_by_branch, modinfo.get("modules"))
+        if candidate_modules:
+            sys.stderr.write("[*] querying fleet module_stats.py for %s ...\n"
+                             % ", ".join(candidate_modules))
+        for mod in candidate_modules:
+            stats = fetch_module_stats(mod, script_path=module_stats_script)
+            if stats:
+                module_stats[mod] = stats
+
     sources = ["CVEProject/cvelistV5"]
     if dyad:
         sources.append("kernel vulns.git (dyad)")
@@ -1165,7 +1499,16 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
         sources.append("FIRST EPSS")
     sources.append("CISA KEV" if kev else "CISA KEV (not listed)")
     if patches:
-        sources.append("git.kernel.org (commits)")
+        local_patches = any(p.get("raw_url") is None for p in patches.values())
+        remote_patches = any(p.get("raw_url") is not None for p in patches.values())
+        if local_patches:
+            sources.append("local Linux source (%s)" % linux_src)
+        if remote_patches:
+            sources.append("git.kernel.org (commits)")
+    if module_by_branch:
+        sources.append("find_module_new.py + local .config (per-branch module resolution)")
+    if module_stats:
+        sources.append("module_stats.py (fleet module-usage stats)")
     if redhat:
         sources.append("Red Hat Security Data API")
     if archlinux:
@@ -1201,14 +1544,13 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True):
         "functions_derived": functions_derived,
         "modules": modinfo["modules"], "config": modinfo["config"],
         "makefiles": modinfo["makefiles"], "repos": repos,
+        "module_by_branch": module_by_branch, "module_stats": module_stats,
         "cvss": cvss, "cwe": cwe, "epss": epss, "kev": kev, "ssvc": ssvc,
         "versions": versions, "cpe_ranges": cpe,
         "references": refs, "patches": patches, "sources_used": sources,
         "nvd_status": nvd.get("vulnStatus") if nvd else "Not in NVD",
-        "redhat": redhat, "archlinux": archlinux, "osv": osv,
         "exploitdb": exploitdb, "debian": debian, "lkc": lkc,
         "ubuntu_link": UBUNTU_CVE_PAGE % cve_id if fetch_vendor else None,
-        "suse_link": SUSE_CVE_PAGE % cve_id if fetch_vendor else None,
         "feedly": feedly, "hackerwire": hackerwire,
         "hackernews_coverage": hackernews_coverage,
         "cybersecuritynews_coverage": csn_coverage,
@@ -1238,6 +1580,107 @@ def _fmt_date(iso):
 
 def _short(c):
     return c[:12] if c else "?"
+
+
+# zLLM's upstream enforces a hard cap on the 'content' field of each chat
+# message; stay well under it (leaves room for the prompt template + system
+# prompt on top of the JSON data pack itself).
+ZLLM_MAX_DATA_PACK_CHARS = 350000
+
+
+def _slim_patches(patches, body_chars=1200, max_list_items=40):
+    """Drop the raw/full commit body down to a short excerpt and cap
+    files/functions list length -- some commits (e.g. the kernel's initial
+    git-import commit) touch tens of thousands of files and would otherwise
+    blow past the LLM's content-length limit by themselves."""
+    out = {}
+    for commit, p in (patches or {}).items():
+        body = p.get("body") or ""
+        if len(body) > body_chars:
+            body = body[:body_chars] + " …(truncated)"
+        files = p.get("files") or []
+        functions = p.get("functions") or []
+        out[commit] = {
+            "commit": p.get("commit"), "web_url": p.get("web_url"),
+            "author": p.get("author"), "date": p.get("date"),
+            "subject": p.get("subject"), "body": body,
+            "files": files[:max_list_items] + (
+                ["… (+%d more files)" % (len(files) - max_list_items)]
+                if len(files) > max_list_items else []),
+            "functions": functions[:max_list_items] + (
+                ["… (+%d more)" % (len(functions) - max_list_items)]
+                if len(functions) > max_list_items else []),
+            "insertions": p.get("insertions"), "deletions": p.get("deletions"),
+        }
+    return out
+
+
+def _slim_data_pack(record, max_len=ZLLM_MAX_DATA_PACK_CHARS):
+    """Build a JSON-serializable copy of the data pack that fits under
+    max_len characters, progressively dropping/truncating the least
+    essential and largest fields (patch bodies, media chatter, long refs)
+    before ever touching core fields like CVSS/versions/description."""
+    r = dict(record)
+    r["patches"] = _slim_patches(record.get("patches"))
+
+    def _size():
+        return len(json.dumps(r, ensure_ascii=False))
+
+    if _size() <= max_len:
+        return r
+
+    # 1. shorten patch commit-message bodies further
+    r["patches"] = _slim_patches(record.get("patches"), body_chars=300)
+    if _size() <= max_len:
+        return r
+
+    # 2. trim bulky, non-essential coverage/reference detail
+    if r.get("feedly"):
+        r["feedly"] = {k: v for k, v in r["feedly"].items() if k != "chatter"}
+    for key in ("hackernews_coverage", "cybersecuritynews_coverage",
+                "securityonline_coverage"):
+        if r.get(key):
+            r[key] = r[key][:1]
+    if r.get("references", {}).get("other"):
+        r["references"] = dict(r["references"])
+        r["references"]["other"] = r["references"]["other"][:5]
+    if _size() <= max_len:
+        return r
+
+    # 3. drop patch bodies entirely, keep only subject/metadata
+    for p in r["patches"].values():
+        p["body"] = None
+    if _size() <= max_len:
+        return r
+
+    # 4. last resort: keep only the mainline + intro commit patches
+    v = r.get("versions") or {}
+    keep = set(v.get("intro_commits") or [])
+    ml = v.get("mainline_commit")
+    if ml:
+        keep.add(ml)
+    r["patches"] = {c: p for c, p in r["patches"].items() if c in keep}
+    return r
+
+
+def render_markdown_llm(r, model=None):
+    """Have the zLLM proxy write the report from the raw data pack. This is
+    the primary rendering path; render_markdown() (template-based) remains
+    available for --template/offline use."""
+    data_pack = _slim_data_pack(r)
+    user = ZLLM_REPORT_USER_TEMPLATE % (
+        r["cve_id"], json.dumps(data_pack, indent=2, ensure_ascii=False))
+    body = llm_chat(ZLLM_REPORT_SYSTEM_PROMPT, user, model=model)
+    header = ("> Auto-generated %s via zLLM (%s) · sources: %s\n\n" % (
+        r["generated_at"], model or ZLLM_MODEL, ", ".join(r["sources_used"])))
+    if not body.lstrip().startswith("#"):
+        body = ("# %s — %s\n\n" % (r["cve_id"], r["title"])) + body
+    lines = body.split("\n", 1)
+    if len(lines) == 2:
+        body = lines[0] + "\n\n" + header + lines[1]
+    else:
+        body = body + "\n\n" + header
+    return body
 
 
 def render_markdown(r):
@@ -1337,6 +1780,43 @@ def render_markdown(r):
     if r["repos"]:
         a("- **Source repo:** %s" % r["repos"][0])
     a("")
+
+    mbb = r.get("module_by_branch") or {}
+    if mbb:
+        a("### Module resolution by branch (local source + .config)")
+        a("")
+        a("| Branch | File | CONFIG_ symbol | Result |")
+        a("|---|---|---|---|")
+        for branch in sorted(mbb):
+            seen_rows = set()
+            for cfg_entry in mbb[branch]:
+                for fe in cfg_entry["files"]:
+                    row = (fe["file"], fe["config_symbol"], fe["result"])
+                    if row in seen_rows:
+                        continue
+                    seen_rows.add(row)
+                    a("| `%s` | `%s` | %s | %s |" % (
+                        branch, fe["file"],
+                        ("`%s`" % fe["config_symbol"]) if fe["config_symbol"] else "—",
+                        fe["result"]))
+        a("")
+
+    ms = r.get("module_stats") or {}
+    if ms:
+        a("### Fleet exposure (module_stats.py)")
+        a("")
+        for mod, stats in ms.items():
+            a("**Module `%s`:**" % mod)
+            a("")
+            a("| Region | Total IPs | Loaded | ZServices | VMs | Phys Srv | "
+              "KVM Host | Cont Host | Containers |")
+            a("|---|---|---|---|---|---|---|---|---|")
+            for row in stats.get("rows") or []:
+                a("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                    row.get("region"), row.get("total_ips"), row.get("loaded"),
+                    row.get("zservices"), row.get("vms"), row.get("phys_srv"),
+                    row.get("kvm_host"), row.get("cont_host"), row.get("containers")))
+            a("")
 
     # 3. affected & fixed versions
     a("## 3. Affected & fixed versions")
@@ -1468,67 +1948,34 @@ def render_markdown(r):
                 a("- %s" % u)
             a("")
 
-    # 8. vendor / distro cross-references
-    a("## 8. Vendor & distro cross-references")
+    # 8. Debian
+    a("## 8. Debian")
     a("")
-    rh, arch, deb, osv = r.get("redhat"), r.get("archlinux"), \
-        r.get("debian"), r.get("osv")
+    deb = r.get("debian")
     lkc = r.get("lkc")
     if r.get("ubuntu_link") is None:
         a("_Skipped (--no-vendor)._")
         a("")
     else:
-        a("| Tracker | Status | Notes | Link |")
-        a("|---|---|---|---|")
-        if rh:
-            advs = ", ".join("[%s](https://access.redhat.com/errata/%s)"
-                             % (x["id"], x["id"]) for x in rh["advisories"][:3])
-            more = " (+%d more)" % (len(rh["advisories"]) - 3) \
-                if len(rh["advisories"]) > 3 else ""
-            a("| Red Hat | %s%s | %s%s | %s |" % (
-                rh.get("severity") or "—",
-                (" (CVSS3 %s)" % rh["cvss3_score"]) if rh.get("cvss3_score")
-                else "",
-                advs or "no RHSA advisory on file", more, rh["link"]))
-        else:
-            a("| Red Hat | not tracked | — | %s |" % (REDHAT_CVE_PAGE % r["cve_id"]))
         if deb:
-            resolved = [x for x in deb["releases"] if x["status"] == "resolved"]
-            open_ = [x for x in deb["releases"] if x["status"] != "resolved"]
-            bits = []
-            if resolved:
-                bits.append("fixed: %s" % ", ".join(
-                    "%s (%s)" % (x["suite"], x["fixed_version"] or "?")
-                    for x in resolved))
-            if open_:
-                bits.append("open: %s" % ", ".join(x["suite"] for x in open_))
-            a("| Debian | %s package | %s | %s |" % (
-                deb["package"], "; ".join(bits) or "no per-suite data",
-                deb["link"]))
+            a("- **Package:** `%s`" % deb["package"])
+            a("- **Link:** %s" % deb["link"])
+            a("")
+            if deb["releases"]:
+                a("| Suite | Status | Fixed version |")
+                a("|---|---|---|")
+                for x in deb["releases"]:
+                    a("| %s | %s | %s |" % (
+                        x["suite"], x["status"],
+                        ("`%s`" % x["fixed_version"]) if x["fixed_version"]
+                        else "—"))
+                a("")
         elif r["is_kernel"]:
-            a("| Debian | not tracked | — | %s |" % (DEBIAN_CVE_PAGE % r["cve_id"]))
+            a("Not tracked by Debian: %s" % (DEBIAN_CVE_PAGE % r["cve_id"]))
+            a("")
         else:
-            a("| Debian | — | not queried (non-kernel CVE) | %s |"
-              % (DEBIAN_CVE_PAGE % r["cve_id"]))
-        a("| Ubuntu | — | not queried live (no reliable per-CVE API) | %s |"
-          % (r.get("ubuntu_link") or "—"))
-        a("| SUSE | — | not queried live (no public API, HTML only) | %s |"
-          % (r.get("suse_link") or "—"))
-        if arch:
-            status = arch.get("status") or ("tracked" if arch.get("severity")
-                                            else "—")
-            fix = (" — fixed %s" % arch["fixed"]) if arch.get("fixed") else ""
-            a("| Arch Linux | %s%s | severity: %s | %s |" % (
-                status, fix, arch.get("severity") or "—", arch["link"]))
-        else:
-            a("| Arch Linux | not tracked | — | — |")
-        if osv:
-            rel = ", ".join(osv["related"][:5]) if osv["related"] else \
-                "no related advisories listed"
-            a("| OSV.dev | tracked | %s | %s |" % (rel, osv["link"]))
-        else:
-            a("| OSV.dev | not tracked | — | %s |" % (OSV_PAGE % r["cve_id"]))
-        a("")
+            a("Not queried (non-kernel CVE): %s" % (DEBIAN_CVE_PAGE % r["cve_id"]))
+            a("")
         if lkc:
             bits = []
             if lkc.get("affected_versions"):
@@ -1540,11 +1987,6 @@ def render_markdown(r):
                 a("_Community cross-check (linuxkernelcves.com, "
                   "no accuracy guarantee):_ %s." % "; ".join(bits))
                 a("")
-        if rh and rh.get("mitigation"):
-            a("**Red Hat mitigation notes:**")
-            a("")
-            a("> %s" % rh["mitigation"].replace("\n", "\n> "))
-            a("")
 
     # 9. media & community coverage
     a("## 9. Media & community coverage")
@@ -1655,6 +2097,30 @@ def main(argv=None):
     ap.add_argument("--no-media", action="store_true",
                     help="skip Feedly/Hacker Wire/Hacker News/community "
                          "media coverage lookups (faster, less detail)")
+    ap.add_argument("--template", action="store_true",
+                    help="use the built-in template renderer instead of the "
+                         "zLLM proxy")
+    ap.add_argument("--llm-model", help="zLLM model id to use (default: %s, "
+                    "or $ZLLM_MODEL)" % ZLLM_MODEL)
+    ap.add_argument("--linux-src", default=LINUX_SRC_DEFAULT,
+                    help="local Linux git checkout, used for per-branch "
+                         "module resolution and to read commit patches "
+                         "without hitting git.kernel.org (default: %s)"
+                         % LINUX_SRC_DEFAULT)
+    ap.add_argument("--configs-dir", default=CONFIGS_DIR_DEFAULT,
+                    help="directory of config-<version> files used for "
+                         "per-branch module resolution (default: %s)"
+                         % CONFIGS_DIR_DEFAULT)
+    ap.add_argument("--no-module-resolve", action="store_true",
+                    help="skip per-branch/per-config module resolution "
+                         "(faster, less detail)")
+    ap.add_argument("--module-stats-script", default=MODULE_STATS_SCRIPT_DEFAULT,
+                    help="path to module_stats.py, used to report fleet-wide "
+                         "module usage stats (default: %s)"
+                         % MODULE_STATS_SCRIPT_DEFAULT)
+    ap.add_argument("--no-module-stats", action="store_true",
+                    help="skip querying module_stats.py for fleet exposure "
+                         "(faster, less detail)")
     args = ap.parse_args(argv)
 
     cve = args.cve.strip().upper()
@@ -1663,13 +2129,23 @@ def main(argv=None):
 
     record = build_record(cve, fetch_diffs=not args.no_diff,
                           fetch_vendor=not args.no_vendor,
-                          fetch_media=not args.no_media)
+                          fetch_media=not args.no_media,
+                          linux_src=args.linux_src,
+                          configs_dir=args.configs_dir,
+                          resolve_modules=not args.no_module_resolve,
+                          fetch_module_stats_flag=not args.no_module_stats,
+                          module_stats_script=args.module_stats_script)
 
     if args.json_only:
         sys.stdout.write(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
         return 0
 
-    md = render_markdown(record)
+    if args.template:
+        md = render_markdown(record)
+    else:
+        sys.stderr.write("[*] writing report via zLLM (%s) ...\n" %
+                         (args.llm_model or ZLLM_MODEL))
+        md = render_markdown_llm(record, model=args.llm_model)
     if args.stdout:
         sys.stdout.write(md + "\n")
     else:
