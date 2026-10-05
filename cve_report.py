@@ -108,7 +108,7 @@ ZLLM_REPORT_SYSTEM_PROMPT = (
 ZLLM_REPORT_USER_TEMPLATE = (
     "Write a complete, detailed CVE report in Markdown for %s using only "
     "the JSON data pack below. Structure it with these sections in order: "
-    "1. At a glance (key facts table: CVSS, CWE, EPSS, CISA KEV/SSVC, NVD "
+    "1. At a glance (key facts table: CVSS, CWE (always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell), EPSS, CISA KEV/SSVC, NVD "
     "status, public exploit availability), 2. Affected component (product, "
     "subsystem, module, files, functions, kernel config; if the JSON has a "
     "'module_by_branch' field, include a per-branch/per-config module "
@@ -670,12 +670,12 @@ def _fetch_patch_local(commit, linux_src):
         out["body"] = rest.strip() or None
 
     out["files"] = re.findall(r"^diff --git a/(\S+) b/\S+", diff_part, re.MULTILINE)
-    dm = re.search(r"(\d+) insertion", raw)
-    if dm:
-        out["insertions"] = int(dm.group(1))
-    dm = re.search(r"(\d+) deletion", raw)
-    if dm:
-        out["deletions"] = int(dm.group(1))
+    # plain `git show` prints no diffstat, so count the changed diff lines
+    # (skip the ---/+++ file headers)
+    out["insertions"] = sum(1 for ln in diff_part.split("\n")
+                            if ln.startswith("+") and not ln.startswith("+++"))
+    out["deletions"] = sum(1 for ln in diff_part.split("\n")
+                           if ln.startswith("-") and not ln.startswith("---"))
 
     funcs, cur_src = [], False
     for line in diff_part.split("\n"):
@@ -1872,6 +1872,8 @@ def render_markdown(r):
         a("**Class:** %s%s" % (
             r["cwe"]["id"],
             (" — %s" % r["cwe"]["name"]) if r["cwe"].get("name") else ""))
+        a("")
+        a("_Source: %s_" % r["cwe"]["source"])
         a("")
     a("**Upstream description:**")
     a("")
