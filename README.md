@@ -25,20 +25,40 @@ Add `--brief` for a short version:
 
 ### 2. Standalone script (fast, deterministic, batchable)
 
-No Claude needed — pure Python (stdlib only):
+Pure Python (stdlib only). By default the report is written by a local **zLLM**
+proxy (OpenAI-compatible) from a JSON data pack; use `--template` for the built-in
+offline renderer.
 
 ```
-python3 cve_report.py CVE-2026-53359              # writes CVE-2026-53359_report.md
+python3 cve_report.py CVE-2026-53359              # writes CVE-2026-53359_report.md (via zLLM)
+python3 cve_report.py CVE-2026-53359 --template   # built-in renderer, no LLM needed
 python3 cve_report.py CVE-2026-53359 --stdout     # print to stdout, write nothing
 python3 cve_report.py CVE-2026-53359 --json       # also write CVE-2026-53359_data.json
 python3 cve_report.py CVE-2026-53359 --json-only  # print the raw data pack (JSON) only
-python3 cve_report.py CVE-2026-53359 --no-diff    # skip commit patches (faster, less detail)
 python3 cve_report.py CVE-2026-53359 -o out.md    # custom output path
 ```
 
-The standalone report is complete on data (every field, tables, references) but its
-analysis prose is drawn straight from the upstream commit message. Use `/cve` when
-you want reasoned root-cause / exploitation analysis.
+Options:
+
+| Flag | Effect |
+|---|---|
+| `--template` | Use the built-in template renderer instead of zLLM |
+| `--llm-model MODEL` | zLLM model id (default `gpt-5.4` or `$ZLLM_MODEL`) |
+| `--no-diff` | Skip commit patches |
+| `--no-vendor` | Skip Debian / Exploit-DB / linuxkernelcves / TuxCare lookups |
+| `--no-media` | Skip Feedly / Hacker Wire / Hacker News / community coverage |
+| `--linux-src PATH` | Local Linux git checkout (default `~/Linux_Stable/linux`) |
+| `--configs-dir PATH` | Directory of `config-<version>` files (default `./configs`) |
+| `--no-module-resolve` | Skip per-branch module resolution |
+| `--module-stats-script PATH` | Path to `module_stats.py` (default `~/Server-Modules/Scripts/module_stats.py`) |
+| `--no-module-stats` | Skip fleet exposure lookup |
+
+zLLM environment variables: `ZLLM_BASE_URL` (default `http://127.0.0.1:8787/v1`),
+`ZLLM_API_KEY` (default `unused`), `ZLLM_MODEL` (default `gpt-5.4`). Start the proxy
+with `zllm start`; if it is unreachable the script exits with an error (no silent
+fallback), so use `--template` for offline runs.
+
+The LLM only uses facts from the data pack; missing fields are reported as such.
 
 Batch example:
 
@@ -50,19 +70,56 @@ done
 
 ## What goes in a report
 
-- **At a glance** — CVSS (v3.1/v4.0), CWE, EPSS score, CISA KEV status, CISA SSVC
-  (Exploitation / Automatable / Technical Impact), NVD status, publish/update dates.
-- **Affected component** — subsystem, module (`.ko`), changed file(s) and
-  function(s), derived `CONFIG_*`, source repo.
-- **Affected & fixed versions** — introducing commit + version, and a per-branch
-  table mapping every fix commit to its stable release (6.1.y, 6.6.y, …, mainline),
-  plus the vulnerable CPE ranges.
-- **Vulnerability details** — the full upstream commit message; `/cve` adds a
-  subsystem primer, root-cause analysis, impact, and exploitation assessment.
-- **The fix** — mainline commit, author, date, diffstat.
-- **Mitigations & detection** and a categorized **References** list (official fix
-  commits, CVE/NVD records, discussion threads, distro advisories).
-- **Provenance** — exactly which sources were used.
+- **At a glance** — CVSS (v3.1/v4.0), CWE (all official IDs with source), EPSS,
+  CISA KEV, CISA SSVC, NVD status, public exploit (Exploit-DB), dates.
+- **Affected component** — subsystem, module (`.ko`), files, functions, `CONFIG_*`,
+  plus a per-branch module resolution table (Branch | File | CONFIG_ symbol | Result)
+  for 5.10.y / 6.1.y / 6.12.y from the local source tree and `.config` files.
+- **Affected & fixed versions** — introducing commit/version, per-branch fixed
+  releases with commit dates, EOL/unfixed branches, CPE ranges.
+- **Fleet exposure** — per-region module usage from `module_stats.py` (Total IPs,
+  Loaded, ZServices, VMs, Phys Srv, KVM Host, Cont Host, Containers).
+- **Vulnerability details** — weakness class, upstream description, and a
+  **TuxCare status** table (CVE link, Debian ELS / KernelCare fixes).
+- **The fix** — mainline commit, subject, author, commit date, diffstat, patch link,
+  stable backports table.
+- **Mitigations & detection**, categorized **References**, **Debian** per-suite
+  status, **Media & community coverage**, and **Provenance**.
+
+Red Hat, Ubuntu, SUSE, Arch and OSV sections are intentionally not included.
+
+### CWE
+
+Only official CWE data is shown; nothing is guessed. Sources are checked in order
+**CNA** (cvelistV5), then **NVD**, then **CISA-ADP** (cvelistV5 `adp` containers).
+The first source with any CWE wins and **all** its CWEs are listed (e.g.
+`CWE-362, CWE-416`) with the source named. If none has one, the report says
+"No official record".
+
+### Dates
+
+Only the **commit date** is used (never the author date). It is read from the local
+Linux tree with `git show -s --format=%cd <commit>`; if a commit is not in the local
+tree, no date is shown.
+
+### NVD status
+
+NVD status is the `vulnStatus` field from the NVD API. It shows where the CVE is in
+NVD's processing.
+
+For example, CVE-2026-80844 has status **Received**: NVD has ingested the record
+from the CVE list but hasn't analyzed it yet, so the report has no NVD CVSS score
+and no NVD CWE for it.
+
+Common values, in the usual order:
+
+- **Received:** ingested, not yet reviewed.
+- **Awaiting Analysis:** queued for an analyst.
+- **Undergoing Analysis:** being scored and enriched.
+- **Analyzed:** complete, with CVSS, CWE and CPE data.
+- **Modified:** changed after analysis, so it needs re-review.
+- **Deferred:** NVD will not analyze it for now.
+- **Rejected:** withdrawn.
 
 ## Data sources (all official / trusted)
 
@@ -72,14 +129,24 @@ done
 | [NVD 2.0 API](https://services.nvd.nist.gov) | CVSS (fallback), CWE, vuln status, extra references |
 | [FIRST EPSS](https://www.first.org/epss/) | Exploit-prediction score & percentile |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | Known-exploited status |
-| [git.kernel.org](https://git.kernel.org) | Commit patches: dates, authors, diffs, changed functions; directory `Makefile` for CONFIG derivation |
+| [kernel vulns.git](https://git.kernel.org/pub/scm/linux/security/vulns.git) | Authoritative dyad: vulnerable:fixed commit/release pairs |
+| [git.kernel.org](https://git.kernel.org) | Commit patches (fallback when not in local tree), directory `Makefile` for CONFIG derivation |
+| Local Linux tree + `find_module_new.py` | Commit dates/patches via `git show`; per-branch module resolution |
+| `module_stats.py` (internal) | Fleet-wide module usage |
+| [Debian Security Tracker](https://security-tracker.debian.org) | Per-suite status / fixed version |
+| [TuxCare CVE tracker](https://tuxcare.com/cve-tracker/) | Debian ELS / KernelCare fix status |
+| [Exploit-DB](https://www.exploit-db.com), [linuxkernelcves.com](https://github.com/nluedtke/linux_kernel_cves) | Public exploits, colloquial name |
+| Feedly, The Hacker Wire, The Hacker News, CyberSecurityNews, SecurityOnline | Media & community coverage |
 
 ## Notes
 
 - **No third-party dependencies.** Pure Python 3 stdlib.
 - **NVD rate limits:** anonymous NVD access is limited. Set `NVD_API_KEY` in your
   environment to raise the limit (get a free key at nvd.nist.gov).
-- **Caching:** the CISA KEV catalog is cached for 6h under `$TMPDIR/cve_report_cache`.
+- **Caching:** the CISA KEV catalog (6h), Debian tracker and linuxkernelcves data
+  (24h) are cached under `$TMPDIR/cve_report_cache`.
+- **Large data packs:** the JSON sent to zLLM is slimmed (patch bodies, media
+  chatter) to stay under the proxy's content-length limit.
 - **How the version mapping works:** the per-branch fix→release table comes from
   the kernel security team's authoritative **dyad** file in
   [vulns.git](https://git.kernel.org/pub/scm/linux/security/vulns.git)
