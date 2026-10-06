@@ -125,7 +125,11 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "Region | Total IPs | Loaded | ZServices | VMs | Phys Srv | KVM Host | "
     "Cont Host | Containers, using exactly that per-region data, one row "
     "per entry including the 'All regions' aggregate row), "
-    "4. Vulnerability details (weakness class and the upstream description), "
+    "4. Vulnerability details (weakness class and the upstream description; "
+    "then, only if the JSON has a 'tuxcare' field, a '### TuxCare status' "
+    "subheading with a Field | Value table: a 'CVE-link' row with the link, "
+    "and a 'Fixed' row listing each entry of 'fixes' on its own line as "
+    "'<os> - <kind> (<status>)', e.g. 'Debian11 - ELS FIX (2026-09-07)'), "
     "5. The fix (mainline commit, subject, author, date, diffstat, patch "
     "link, plus a stable-backports table with columns Branch | Commit | "
     "Date | Patch link -- always include the commit date column, taken "
@@ -154,6 +158,7 @@ EXPLOITDB_SEARCH = "https://www.exploit-db.com/search?cve=%s"
 EXPLOITDB_EXPLOIT_PAGE = "https://www.exploit-db.com/exploits/%s"
 UBUNTU_CVE_PAGE = "https://ubuntu.com/security/%s"
 SUSE_CVE_PAGE = "https://www.suse.com/security/cve/%s.html"
+TUXCARE_CVE_PAGE = "https://tuxcare.com/cve-tracker/cve/details/%s/"
 
 # media / community coverage sources (verified empirically -- see
 # fetch_feedly/fetch_hackerwire/fetch_hackernews_coverage/fetch_wp_coverage)
@@ -535,6 +540,41 @@ def fetch_hackernews_coverage(cve_id, colloquial_name=None, limit=3):
         if out:
             return out
     return [] if reached else None
+
+
+def fetch_tuxcare(cve_id):
+    """TuxCare CVE tracker page (server-rendered HTML): Debian ELS fixes come
+    from the embedded `allData` JSON, KernelCare (live-patch) state from the
+    'KernelCare state' table. Returns None if the CVE isn't on TuxCare or has
+    no Debian entries."""
+    link = TUXCARE_CVE_PAGE % cve_id.lower()
+    html = _http_text(link, timeout=20)
+    if not html:
+        return None
+    fixes = []
+    m = re.search(r"const allData = (\[.*?\]);", html, re.S)
+    if m:
+        try:
+            for d in json.loads(m.group(1)):
+                dm = re.match(r"^Debian (\d+) ELS$", d.get("product") or "")
+                if dm and d.get("fix_status") == "released":
+                    fixes.append({"os": "Debian%s" % dm.group(1), "kind": "ELS FIX",
+                                  "status": d.get("last_update")})
+        except Exception:  # noqa: BLE001
+            pass
+    sec = re.search(r"KernelCare state(.*?)</table>", html, re.S)
+    if sec:
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", sec.group(1), re.S):
+            cells = [re.sub(r"<[^>]+>", "", c).strip()
+                     for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+            dm = re.match(r"^Debian\s*(\d+)$", cells[0]) if len(cells) >= 2 else None
+            if dm:
+                fixes.append({"os": "Debian%s" % dm.group(1), "kind": "KCARE FIX",
+                              "status": cells[1]})
+    if not fixes:
+        return None
+    fixes.sort(key=lambda x: (int(re.sub(r"\D", "", x["os"])), x["kind"]))
+    return {"link": link, "fixes": fixes}
 
 
 def fetch_hackerwire(cve_id):
@@ -1360,7 +1400,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
     epss = fetch_epss(cve_id)
     kev = fetch_kev(cve_id)
 
-    redhat = archlinux = osv = exploitdb = debian = lkc = None
+    redhat = archlinux = osv = exploitdb = debian = lkc = tuxcare = None
     if fetch_vendor:
         sys.stderr.write("[*] fetching Exploit-DB ...\n")
         exploitdb = summarize_exploitdb(fetch_exploitdb(cve_id))
@@ -1370,6 +1410,8 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
                 "(cached, first run may be slow) ...\n")
             debian = summarize_debian(fetch_debian_entry(cve_id), cve_id)
             lkc = fetch_linuxkernelcves(cve_id)
+            sys.stderr.write("[*] fetching TuxCare tracker ...\n")
+            tuxcare = fetch_tuxcare(cve_id)
 
     feedly = hackerwire = None
     hackernews_coverage = csn_coverage = dcs_coverage = None
@@ -1521,6 +1563,8 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
         sources.append("Debian Security Tracker")
     if lkc:
         sources.append("linuxkernelcves.com")
+    if tuxcare:
+        sources.append("TuxCare CVE tracker")
     if feedly:
         sources.append("Feedly.com")
     if hackerwire:
@@ -1550,6 +1594,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
         "references": refs, "patches": patches, "sources_used": sources,
         "nvd_status": nvd.get("vulnStatus") if nvd else "Not in NVD",
         "exploitdb": exploitdb, "debian": debian, "lkc": lkc,
+        "tuxcare": tuxcare,
         "ubuntu_link": UBUNTU_CVE_PAGE % cve_id if fetch_vendor else None,
         "feedly": feedly, "hackerwire": hackerwire,
         "hackernews_coverage": hackernews_coverage,
@@ -1880,6 +1925,17 @@ def render_markdown(r):
     for line in (r["description"] or "(none)").splitlines():
         a("> %s" % line if line.strip() else ">")
     a("")
+    tc = r.get("tuxcare")
+    if tc:
+        a("### TuxCare status")
+        a("")
+        a("| Field | Value |")
+        a("|---|---|")
+        a("| CVE-link | %s |" % tc["link"])
+        for i, fx in enumerate(tc["fixes"]):
+            a("| %s | %s - %s (%s) |" % (
+                "Fixed" if i == 0 else "", fx["os"], fx["kind"], fx["status"]))
+        a("")
 
     # 5. the fix
     a("## 5. The fix")
