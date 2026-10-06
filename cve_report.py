@@ -103,7 +103,12 @@ ZLLM_REPORT_SYSTEM_PROMPT = (
     "field is missing or null, say so plainly instead of guessing. "
     "Write clean, well-structured Markdown with headings, tables, and "
     "bullet lists as appropriate; do not wrap the whole answer in a code "
-    "fence."
+    "fence. The output must read as a formal, official vulnerability "
+    "report/advisory: NEVER mention the JSON, the 'data pack', field or key "
+    "names (e.g. 'cwe.ids', 'module_by_branch', 'functions_derived'), or "
+    "that the text was generated from supplied data. Where information is "
+    "missing, write 'Not available' or 'Not yet assessed' in the "
+    "appropriate place instead of explaining what the data lacks."
 )
 ZLLM_REPORT_USER_TEMPLATE = (
     "Write a complete, detailed CVE report in Markdown for %s using only "
@@ -138,8 +143,9 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "other), 8. Debian (package, link, per-suite status/fixed version table; "
     "do NOT include Red Hat, Ubuntu, SUSE, Arch or OSV sections), 9. Media & community coverage, "
     "10. Provenance (data sources used, version-mapping source, generation "
-    "timestamp). Omit any section entirely if the data pack has nothing "
-    "for it.\n\nJSON data pack:\n```json\n%s\n```"
+    "timestamp). Omit any section entirely if there is nothing "
+    "for it. Do not refer to any JSON or data pack in the report text."
+    "\n\nJSON data pack:\n```json\n%s\n```"
 )
 
 # vendor / distro / aggregator sources (verified empirically: no auth, no API
@@ -1740,8 +1746,8 @@ def render_markdown_llm(r, model=None):
     user = ZLLM_REPORT_USER_TEMPLATE % (
         r["cve_id"], json.dumps(data_pack, indent=2, ensure_ascii=False))
     body = llm_chat(ZLLM_REPORT_SYSTEM_PROMPT, user, model=model)
-    header = ("> Auto-generated %s via zLLM (%s) · sources: %s\n\n" % (
-        r["generated_at"], model or ZLLM_MODEL, ", ".join(r["sources_used"])))
+    header = ("> Generated %s · sources: %s\n\n" % (
+        r["generated_at"], ", ".join(r["sources_used"])))
     if not body.lstrip().startswith("#"):
         body = ("# %s — %s\n\n" % (r["cve_id"], r["title"])) + body
     lines = body.split("\n", 1)
