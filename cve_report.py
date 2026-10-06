@@ -108,7 +108,7 @@ ZLLM_REPORT_SYSTEM_PROMPT = (
 ZLLM_REPORT_USER_TEMPLATE = (
     "Write a complete, detailed CVE report in Markdown for %s using only "
     "the JSON data pack below. Structure it with these sections in order: "
-    "1. At a glance (key facts table: CVSS, CWE (always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell), EPSS, CISA KEV/SSVC, NVD "
+    "1. At a glance (key facts table: CVSS, CWE (list ALL ids in the JSON 'cwe.ids' list, comma-separated; always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell), EPSS, CISA KEV/SSVC, NVD "
     "status, public exploit availability), 2. Affected component (product, "
     "subsystem, module, files, functions, kernel config; if the JSON has a "
     "'module_by_branch' field, include a per-branch/per-config module "
@@ -1178,7 +1178,22 @@ def parse_cvss(cvelist, nvd):
 
 
 def parse_cwe(cvelist, nvd, title, desc):
+    def build(items, source):
+        # items: [(cwe_id, name_or_None)], deduplicated, order preserved
+        uniq, seen = [], set()
+        for cid, name in items:
+            if cid not in seen:
+                seen.add(cid)
+                uniq.append((cid, name))
+        if not uniq:
+            return None
+        return {"id": ", ".join(i for i, _ in uniq),
+                "ids": [i for i, _ in uniq],
+                "name": uniq[0][1] if len(uniq) == 1 else None,
+                "source": source, "derived": False}
+
     def from_problemtypes(container, source):
+        items = []
         for pt in container.get("problemTypes", []) or []:
             for d in pt.get("descriptions", []) or []:
                 cid = d.get("cweId") or (d.get("description") if
@@ -1187,26 +1202,27 @@ def parse_cwe(cvelist, nvd, title, desc):
                     name = d.get("description")
                     if name and name.startswith("CWE-"):
                         name = name.split(" ", 1)[1] if " " in name else None
-                    return {"id": cid, "name": name, "source": source,
-                            "derived": False}
-        return None
+                    items.append((cid, name))
+        return build(items, source)
 
     cna = _dig(cvelist, "containers", "cna", default={}) or {}
     c = from_problemtypes(cna, "CNA")
     if c:
         return c
     if nvd:
-        for w in nvd.get("weaknesses", []) or []:
-            for d in w.get("description", []) or []:
-                if d.get("value", "").startswith("CWE-"):
-                    return {"id": d["value"], "name": None, "source": "NVD",
-                            "derived": False}
+        items = [(d["value"], None)
+                 for w in nvd.get("weaknesses", []) or []
+                 for d in w.get("description", []) or []
+                 if d.get("value", "").startswith("CWE-")]
+        c = build(items, "NVD")
+        if c:
+            return c
     for adp in _dig(cvelist, "containers", "adp", default=[]) or []:
         c = from_problemtypes(adp, "CISA-ADP")
         if c:
             return c
     # no keyword guessing: report the absence of an official CWE
-    return {"id": "No official record", "name": None,
+    return {"id": "No official record", "ids": [], "name": None,
             "source": "none in CNA, NVD or CISA-ADP data", "derived": False}
 
 
