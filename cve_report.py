@@ -125,7 +125,10 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "3. Affected & "
     "fixed versions (introduced version/commit, per-branch fixed releases "
     "table including each commit's date, EOL/unfixed branches), "
-    "3b. Fleet exposure (only if the JSON has a 'module_stats' field: for "
+    "3b. Fleet exposure (if the JSON has a non-empty 'module_not_loaded' "
+    "list, state explicitly for each listed module that it is not loaded "
+    "in any region of the fleet, so the fleet is not exposed via that "
+    "module; and only if the JSON has a 'module_stats' field: for "
     "each module name, render its 'rows' list as a table with columns "
     "Region | Total IPs | Loaded | ZServices | VMs | Phys Srv | KVM Host | "
     "Cont Host | Containers, using exactly that per-region data, one row "
@@ -1551,7 +1554,9 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
 
     # fleet exposure: how widely is the affected module actually loaded
     module_stats = {}
-    if fetch_module_stats_flag and module_stats_script:
+    module_not_loaded = []
+    if (fetch_module_stats_flag and module_stats_script
+            and os.path.isfile(module_stats_script)):
         candidate_modules = _module_names_from_resolution(
             module_by_branch, modinfo.get("modules"))
         if candidate_modules:
@@ -1561,6 +1566,8 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
             stats = fetch_module_stats(mod, script_path=module_stats_script)
             if stats:
                 module_stats[mod] = stats
+            else:
+                module_not_loaded.append(mod)
 
     sources = ["CVEProject/cvelistV5"]
     if dyad:
@@ -1619,6 +1626,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
         "modules": modinfo["modules"], "config": modinfo["config"],
         "makefiles": modinfo["makefiles"], "repos": repos,
         "module_by_branch": module_by_branch, "module_stats": module_stats,
+        "module_not_loaded": module_not_loaded,
         "cvss": cvss, "cwe": cwe, "epss": epss, "kev": kev, "ssvc": ssvc,
         "versions": versions, "cpe_ranges": cpe,
         "references": refs, "patches": patches, "sources_used": sources,
