@@ -685,9 +685,16 @@ def _fetch_patch_local(commit, linux_src):
     m = re.search(r"^Author:\s*(.+)$", header, re.MULTILINE)
     if m:
         out["author"] = m.group(1).strip()
-    m = re.search(r"^AuthorDate:\s*(.+)$", header, re.MULTILINE)
-    if m:
-        out["date"] = m.group(1).strip()
+    # commit date (not author date), straight from the local tree
+    try:
+        cd = subprocess.run(
+            ["git", "show", "-s", "--format=%cd", commit],
+            cwd=linux_src, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=30)
+        if cd.returncode == 0 and cd.stdout.strip():
+            out["date"] = cd.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
 
     lines = header.split("\n")
     body_lines, in_body = [], False
@@ -759,9 +766,8 @@ def fetch_patch(commit, linux_src=None):
     m = re.search(r"^From:\s*(.+)$", header_region, re.MULTILINE)
     if m:
         out["author"] = m.group(1).strip()
-    m = re.search(r"^Date:\s*(.+)$", header_region, re.MULTILINE)
-    if m:
-        out["date"] = m.group(1).strip()
+    # the patch mail 'Date:' is the AUTHOR date; leave date unset here
+    # (commit date is only taken from the local Linux tree)
     m = re.search(r"^Subject:\s*(?:\[[^\]]*\]\s*)?(.+)$", header_region,
                   re.MULTILINE)
     if m:
