@@ -125,7 +125,12 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "3. Affected & "
     "fixed versions (introduced version/commit, per-branch fixed releases "
     "table including each commit's date, EOL/unfixed branches), "
-    "3b. Fleet exposure (if the JSON has a non-empty 'module_not_loaded' "
+    "3b. Fleet exposure (if the JSON has a non-empty 'module_builtin' "
+    "list, state that those files are compiled into vmlinux (built-in, "
+    "not a loadable module), so every kernel running a build with that "
+    "CONFIG_ symbol enabled contains the code and fleet module-load "
+    "statistics do not apply; do NOT say such a file's module is 'not "
+    "loaded'; if the JSON has a non-empty 'module_not_loaded' "
     "list, state explicitly for each listed module that it is not loaded "
     "in any region of the fleet, so the fleet is not exposed via that "
     "module; and only if the JSON has a 'module_stats' field: for "
@@ -1555,10 +1560,21 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
     # fleet exposure: how widely is the affected module actually loaded
     module_stats = {}
     module_not_loaded = []
+    module_builtin = []
+    for _entries in (module_by_branch or {}).values():
+        for _cfg in _entries:
+            for _fe in _cfg.get("files", []):
+                _res = _fe.get("result") or ""
+                if "vmlinux" in _res and ".ko" not in _res:
+                    _b = {"file": _fe.get("file"),
+                          "config_symbol": _fe.get("config_symbol")}
+                    if _b not in module_builtin:
+                        module_builtin.append(_b)
     if (fetch_module_stats_flag and module_stats_script
             and os.path.isfile(module_stats_script)):
         candidate_modules = _module_names_from_resolution(
-            module_by_branch, modinfo.get("modules"))
+            module_by_branch, None if module_by_branch
+            else modinfo.get("modules"))
         if candidate_modules:
             sys.stderr.write("[*] querying fleet module_stats.py for %s ...\n"
                              % ", ".join(candidate_modules))
@@ -1613,6 +1629,78 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
     if dcs_coverage is not None:
         sources.append("SecurityOnline.info")
 
+    # sources not included, each with the reason
+    skipped = []
+
+    def _skip(name, reason):
+        skipped.append({"source": name, "reason": reason})
+
+    if not dyad:
+        _skip("kernel vulns.git (dyad)",
+              "not a Linux kernel CNA record" if not is_kernel
+              else "no dyad file published for this CVE")
+    if not nvd:
+        _skip("NVD 2.0 API", "no NVD record returned (not yet ingested or unreachable)")
+    if not epss:
+        _skip("FIRST EPSS", "no EPSS score published or API unreachable")
+    if not patches:
+        _skip("Commit patches",
+              "disabled (--no-diff)" if not fetch_diffs
+              else "not a Linux kernel CVE" if not is_kernel
+              else "no fix commits found, or commits unavailable locally and on git.kernel.org")
+    if not module_by_branch:
+        _skip("Per-branch module resolution",
+              "disabled (--no-module-resolve)" if not resolve_modules
+              else "not a Linux kernel CVE" if not is_kernel
+              else "no affected source files listed in the CVE record" if not files
+              else "local Linux source tree not available" if not (
+                  linux_src and os.path.isdir(os.path.join(linux_src, ".git")))
+              else "no matching .config files or find_module_new.py unavailable")
+    if not module_stats:
+        _skip("Fleet module-usage stats",
+              "disabled (--no-module-stats)" if not fetch_module_stats_flag
+              else "module_stats.py not found" if not (
+                  module_stats_script and os.path.isfile(module_stats_script))
+              else "affected code is built into vmlinux (no loadable module)"
+              if module_builtin and not module_not_loaded
+              else "module not loaded in any fleet region" if module_not_loaded
+              else "no loadable module identified")
+    for _name, _val in (("Red Hat Security Data API", redhat),
+                        ("Arch Linux Security Tracker", archlinux),
+                        ("OSV.dev", osv)):
+        if not _val:
+            _skip(_name, "not queried (excluded from reports by design)")
+    if exploitdb is None:
+        _skip("Exploit-DB", "disabled (--no-vendor)" if not fetch_vendor
+              else "lookup failed")
+    if not debian:
+        _skip("Debian Security Tracker",
+              "disabled (--no-vendor)" if not fetch_vendor
+              else "not a Linux kernel CVE" if not is_kernel
+              else "CVE not tracked by Debian")
+    if not lkc:
+        _skip("linuxkernelcves.com",
+              "disabled (--no-vendor)" if not fetch_vendor
+              else "not a Linux kernel CVE" if not is_kernel
+              else "CVE not present in community dataset")
+    if not tuxcare:
+        _skip("TuxCare CVE tracker",
+              "disabled (--no-vendor)" if not fetch_vendor
+              else "not a Linux kernel CVE" if not is_kernel
+              else "no Debian fix entries on TuxCare, or page unreachable")
+    for _name, _val in (("Feedly.com", feedly), ("The Hacker Wire", hackerwire)):
+        if not _val:
+            _skip(_name, "disabled (--no-media)" if not fetch_media
+                  else "no entry for this CVE")
+    for _name, _val in (("The Hacker News", hackernews_coverage),
+                        ("CyberSecurityNews.com", csn_coverage),
+                        ("SecurityOnline.info", dcs_coverage)):
+        if _val is None:
+            _skip(_name, "disabled (--no-media)" if not fetch_media
+                  else "site unreachable")
+    for _s in skipped:
+        sys.stderr.write("  - not included: %s (%s)\n" % (_s["source"], _s["reason"]))
+
     return {
         "cve_id": cve_id, "title": title, "assigner": assigner,
         "is_kernel": is_kernel, "vendor": vendor, "product": product,
@@ -1627,6 +1715,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
         "makefiles": modinfo["makefiles"], "repos": repos,
         "module_by_branch": module_by_branch, "module_stats": module_stats,
         "module_not_loaded": module_not_loaded,
+        "module_builtin": module_builtin,
         "cvss": cvss, "cwe": cwe, "epss": epss, "kev": kev, "ssvc": ssvc,
         "versions": versions, "cpe_ranges": cpe,
         "references": refs, "patches": patches, "sources_used": sources,
