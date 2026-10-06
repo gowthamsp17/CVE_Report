@@ -1205,7 +1205,9 @@ def parse_cwe(cvelist, nvd, title, desc):
         c = from_problemtypes(adp, "CISA-ADP")
         if c:
             return c
-    return classify_cwe(title + " " + desc)
+    # no keyword guessing: report the absence of an official CWE
+    return {"id": "No official record", "name": None,
+            "source": "none in CNA, NVD or CISA-ADP data", "derived": False}
 
 
 def parse_ssvc(cvelist):
