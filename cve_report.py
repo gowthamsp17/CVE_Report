@@ -114,7 +114,7 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "Write a complete, detailed CVE report in Markdown for %s using only "
     "the JSON data pack below. Structure it with these sections in order: "
     "1. At a glance (key facts table: CVSS, CWE (list ALL ids in the JSON 'cwe.ids' list, comma-separated; always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell), EPSS, CISA KEV/SSVC, NVD "
-    "status, public exploit availability), 2. Affected component (product, "
+    "status, CVE Published date and CVE Last Updated date (from the JSON 'published' and 'updated' fields, formatted as YYYY-MM-DD HH:MM UTC), public exploit availability), 2. Affected component (product, "
     "subsystem, module, files, functions, kernel config; if the JSON has a "
     "'module_by_branch' field, include a per-branch/per-config module "
     "resolution table with columns Branch | File | CONFIG_ symbol "
