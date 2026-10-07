@@ -113,7 +113,7 @@ ZLLM_REPORT_SYSTEM_PROMPT = (
 ZLLM_REPORT_USER_TEMPLATE = (
     "Write a complete, detailed CVE report in Markdown for %s using only "
     "the JSON data pack below. Structure it with these sections in order: "
-    "1. At a glance (key facts table with columns Key | Value and rows in EXACTLY this order: CVE (the CVE ID), Title, Severity / CVSS, CWE (list ALL ids in the JSON 'cwe.ids' list, comma-separated; always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell), EPSS, CISA KEV / SSVC, NVD status, "
+    "1. At a glance (key facts table with columns Key | Value and rows in EXACTLY this order: CVE (the CVE ID), Title, Severity / CVSS, CWE (list ALL ids in the JSON 'cwe.ids' list, comma-separated; always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell; also include each id's official name from 'cwe.details'), EPSS, CISA KEV / SSVC, NVD status, "
     "CVE Published (from the JSON 'published' field, formatted YYYY-MM-DD HH:MM UTC), CVE Last Updated (from the JSON 'updated' field, same format), Public exploit availability), 2. Affected component (product, "
     "subsystem, module, files, functions, kernel config; if the JSON has a "
     "'module_by_branch' field, include a per-branch/per-config module "
@@ -138,7 +138,7 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "Region | Total IPs | Loaded | ZServices | VMs | Phys Srv | KVM Host | "
     "Cont Host | Containers, using exactly that per-region data, one row "
     "per entry including the 'All regions' aggregate row), "
-    "4. Vulnerability details (weakness class and the upstream description; "
+    "4. Vulnerability details (weakness class: for every entry in 'cwe.details' give the CWE id, official name, official description and MITRE link; if 'cwe.details' is empty give only the ids and never invent descriptions; and the upstream description; "
     "then, only if the JSON has a 'tuxcare' field, a '### TuxCare status' "
     "subheading with a Field | Value table: a 'CVE-link' row with the link, "
     "and a 'Fixed' row listing each entry of 'fixes' on its own line as "
@@ -1246,6 +1246,26 @@ def parse_cwe(cvelist, nvd, title, desc):
             "source": "none in CNA, NVD or CISA-ADP data", "derived": False}
 
 
+def fetch_cwe_details(ids):
+    """Official CWE name/description from the MITRE CWE REST API."""
+    out = []
+    for cid in ids:
+        num = cid.replace("CWE-", "")
+        if not num.isdigit():
+            continue
+        try:
+            data = _http_json("https://cwe-api.mitre.org/api/v1/cwe/weakness/%s" % num,
+                              timeout=15)
+            w = (data.get("Weaknesses") or [None])[0]
+        except Exception:
+            w = None
+        if w:
+            out.append({"id": cid, "name": w.get("Name"),
+                        "description": w.get("Description"),
+                        "url": "https://cwe.mitre.org/data/definitions/%s.html" % num})
+    return out
+
+
 def parse_ssvc(cvelist):
     for adp in _dig(cvelist, "containers", "adp", default=[]) or []:
         for m in adp.get("metrics", []) or []:
@@ -1492,6 +1512,7 @@ def build_record(cve_id, fetch_diffs=True, fetch_vendor=True, fetch_media=True,
 
     cvss = parse_cvss(cvelist, nvd)
     cwe = parse_cwe(cvelist, nvd, title, desc)
+    cwe["details"] = fetch_cwe_details(cwe.get("ids") or [])
     ssvc = parse_ssvc(cvelist)
     cpe = parse_cpe_ranges(cvelist)
 
