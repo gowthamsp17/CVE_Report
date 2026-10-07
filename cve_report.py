@@ -113,7 +113,7 @@ ZLLM_REPORT_SYSTEM_PROMPT = (
 ZLLM_REPORT_USER_TEMPLATE = (
     "Write a complete, detailed CVE report in Markdown for %s using only "
     "the JSON data pack below. Structure it with these sections in order: "
-    "1. At a glance (key facts table with columns Key | Value and rows in EXACTLY this order: CVE (the CVE ID), Title, Severity / CVSS, CWE (list ALL ids in the JSON 'cwe.ids' list, comma-separated; always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell; also include each id's official name from 'cwe.details'), EPSS, CISA KEV / SSVC, NVD status, "
+    "1. At a glance (key facts table with columns Key | Value and rows in EXACTLY this order: CVE (the CVE ID), Title, Common name (the public nickname/branding of this vulnerability, e.g. DirtyFrag, only if it is explicitly named for this CVE in the JSON references, repository/URL names, Feedly, news or Hacker Wire items; write 'None published' if there is none, never invent one), Severity / CVSS, CWE (list ALL ids in the JSON 'cwe.ids' list, comma-separated; always state its 'source' field from the JSON, e.g. CNA / NVD / CISA-ADP / derived (keyword), in the same cell; also include each id's official name from 'cwe.details'), EPSS, CISA KEV / SSVC, NVD status, "
     "CVE Published (from the JSON 'published' field, formatted YYYY-MM-DD HH:MM UTC), CVE Last Updated (from the JSON 'updated' field, same format), Public exploit availability), 2. Affected component (product, "
     "subsystem, module, files, functions, kernel config; if the JSON has a "
     "'module_by_branch' field, include a per-branch/per-config module "
