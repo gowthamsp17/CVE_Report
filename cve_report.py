@@ -63,6 +63,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+__version__ = "1.0.0"
 from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------- #
@@ -2288,6 +2290,8 @@ def _fmt_date_hdr(hdr):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Generate a detailed Linux-kernel CVE report.")
+    ap.add_argument("--version", action="version",
+                    version="%(prog)s " + __version__)
     ap.add_argument("cve", help="CVE ID, e.g. CVE-2026-53359")
     ap.add_argument("-o", "--output", help="output file (default <CVE>_report.md)")
     ap.add_argument("--stdout", action="store_true",
