@@ -296,7 +296,8 @@ def llm_chat(system, user, model=None, timeout=180, temperature=0.2):
                  "Authorization": "Bearer %s" % ZLLM_API_KEY,
                  "User-Agent": UA})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace") if e.fp else ""
@@ -2363,9 +2364,9 @@ def main(argv=None):
     else:
         # the local zLLM proxy must be reached directly: temporarily drop
         # the HTTP(S) proxy env vars, then restore them afterwards
-        proxy_names = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
-        saved_proxies = {k: os.environ.pop(k) for k in proxy_names
-                         if k in os.environ}
+        proxy_names = [k for k in os.environ
+                       if k.lower().endswith("_proxy")]
+        saved_proxies = {k: os.environ.pop(k) for k in proxy_names}
         try:
             sys.stderr.write("[*] writing report via zLLM (%s) ...\n" %
                              (args.llm_model or ZLLM_MODEL))
