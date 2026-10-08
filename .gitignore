@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Backups / scratch
+*.old
+.others/
+
+# Local tool settings
+.claude/settings.local.json
+
+# Large binary (zLLM proxy) - install separately
+zllm-linux-x64
+
+# Generated docs
+DOCUMENTATION.pdf
+
+# Raw data packs / text dumps produced by --json
+*_data.json
+*_report.txt
+
+# Generated CVE reports (regenerate with cve_report.py)
+CVE-*_report*.md
+Reports/
