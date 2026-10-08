@@ -2349,9 +2349,17 @@ def main(argv=None):
     if args.template:
         md = render_markdown(record)
     else:
-        sys.stderr.write("[*] writing report via zLLM (%s) ...\n" %
-                         (args.llm_model or ZLLM_MODEL))
-        md = render_markdown_llm(record, model=args.llm_model)
+        # the local zLLM proxy must be reached directly: temporarily drop
+        # the HTTP(S) proxy env vars, then restore them afterwards
+        proxy_names = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+        saved_proxies = {k: os.environ.pop(k) for k in proxy_names
+                         if k in os.environ}
+        try:
+            sys.stderr.write("[*] writing report via zLLM (%s) ...\n" %
+                             (args.llm_model or ZLLM_MODEL))
+            md = render_markdown_llm(record, model=args.llm_model)
+        finally:
+            os.environ.update(saved_proxies)
     if args.stdout:
         sys.stdout.write(md + "\n")
     else:
