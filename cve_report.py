@@ -2333,6 +2333,18 @@ def main(argv=None):
     if not CVE_RE.match(cve):
         ap.error("invalid CVE id: %s (expected CVE-YYYY-NNNNN)" % args.cve)
 
+    # make sure an outbound proxy is configured before any fetching: if
+    # http(s)_proxy is unset, fall back to $CVE_REPORT_PROXY
+    default_proxy = os.environ.get("CVE_REPORT_PROXY")
+    for lower, upper in (("http_proxy", "HTTP_PROXY"),
+                         ("https_proxy", "HTTPS_PROXY")):
+        if not (os.environ.get(lower) or os.environ.get(upper)):
+            if default_proxy:
+                os.environ[lower] = default_proxy
+            else:
+                sys.stderr.write("  ! %s not set and CVE_REPORT_PROXY is "
+                                 "empty; continuing without a proxy\n" % lower)
+
     record = build_record(cve, fetch_diffs=not args.no_diff,
                           fetch_vendor=not args.no_vendor,
                           fetch_media=not args.no_media,
