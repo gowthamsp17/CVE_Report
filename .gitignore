@@ -22,3 +22,6 @@ DOCUMENTATION.pdf
 # Generated CVE reports (regenerate with cve_report.py)
 CVE-*_report*.md
 Reports/
+
+# Local release notes
+RELEASING.md
