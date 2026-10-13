@@ -125,8 +125,13 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "versions), using exactly that data -- this tells you which .ko module "
     "or vmlinux the file builds into for each stable branch/config), "
     "3. Affected & "
-    "fixed versions (introduced version/commit, per-branch fixed releases "
-    "table including each commit's date, EOL/unfixed branches), "
+    "fixed versions (introduced version/commit, then a '### Fixed releases "
+    "by branch' table with columns Branch | Fixed release | Commit | Date, "
+    "where every Commit cell is a Markdown hyperlink whose text is the full "
+    "commit hash in backticks and whose URL is "
+    "https://git.kernel.org/stable/c/<full commit hash>, i.e. "
+    "[`<hash>`](https://git.kernel.org/stable/c/<hash>); take the date from "
+    "each patch's 'date' field; then EOL/unfixed branches), "
     "3b. Fleet exposure (if the JSON has a non-empty 'module_builtin' "
     "list, state that those files are compiled into vmlinux (built-in, "
     "not a loadable module), so every kernel running a build with that "
@@ -146,11 +151,12 @@ ZLLM_REPORT_USER_TEMPLATE = (
     "and a 'Fixed' row listing each entry of 'fixes' on its own line as "
     "'<os> - <kind> (<status>)', e.g. 'Debian11 - ELS FIX (2026-09-07)'), "
     "5. The fix (mainline commit, subject, author, date, diffstat, patch "
-    "link, plus a stable-backports table with columns Branch | Commit | "
-    "Date | Patch link -- always include the commit date column, taken "
-    "from each patch's 'date' field in the JSON), 6. Mitigations & detection, "
-    "7. References (grouped by commits/CVE records/discussion/advisories/"
-    "other), 8. Debian (package, link, per-suite status/fixed version table; "
+    "link and a short explanation of what the patch does; do NOT add a "
+    "separate stable-backports table or list -- the per-branch commits are "
+    "already covered by the 'Fixed releases by branch' table in section 3), "
+    "6. Mitigations & detection, "
+    "7. References (grouped by CVE records/discussion/advisories/other; do "
+    "NOT include a 'Commits' / fix-commits group), 8. Debian (package, link, per-suite status/fixed version table; "
     "do NOT include Red Hat, Ubuntu, SUSE, Arch or OSV sections), 9. Media & community coverage, "
     "10. Provenance (data sources used, version-mapping source, generation "
     "timestamp). Omit any section entirely if there is nothing "
@@ -2145,8 +2151,7 @@ def render_markdown(r):
     # 7. references
     a("## 7. References")
     a("")
-    for key, label in (("commits", "Fix commits"),
-                       ("cve_records", "CVE / NVD records"),
+    for key, label in (("cve_records", "CVE / NVD records"),
                        ("discussion", "Discussion & disclosure"),
                        ("advisories", "Vendor / distro advisories"),
                        ("other", "Other")):
